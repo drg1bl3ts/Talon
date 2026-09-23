@@ -1,27 +1,25 @@
-# 🦅 Talon
+# Talon
 
-### Recon, Parameter & Vulnerability Triage Engine
+### Recon, Parameter, and Vulnerability Triage Engine
 
 Talon is a self-contained pipeline: domain in, triaged vulnerability candidates and a Caido-ready manual-review queue out. It owns the whole chain end to end — subdomain discovery, alive-host detection, DNS resolution, HTTP fingerprinting, port discovery, crawling, historical URL collection, parameter discovery, GF pattern triage, nuclei scanning, JS secret scanning, and reporting.
 
 It calls the underlying recon tools (subfinder, httpx, dnsx, naabu, katana, assetfinder, findomain, subfaster, waymore, paramspider) directly — no wrapper layer, no intermediate process, no other tool required.
 
-> **One tool: domain in, triaged findings out.**
-
 ---
 
-## 🔎 What It Does
+## What It Does
 
-* **Recon** (`recon.py`) — subdomain discovery from 7 sources, run concurrently (hackertarget, agniops, subfinder, urlscan, assetfinder, findomain, subfaster), alive-host detection, DNS resolution, HTTP fingerprinting, port discovery, katana crawling + waymore historical URLs merged and scope-filtered, and parameter discovery (URL-derived + paramspider, parallelized across `--param-jobs` workers)
-* **Scope filter** *(optional, `--scope-file`)* — drops anything outside an explicit in-scope allowlist before a single request goes out to fuzzing, JS-scanning, or Caido
-* **GF pattern triage** — buckets endpoints/params into vuln-class candidates (xss, sqli, ssrf, lfi, rce, ssti, redirect, idor, interestingparams, debug_logic, img-traversal)
-* **Live-exposure check** + high-risk extension filtering (`.git`, `.env`, `.sql`, `.bak`, etc. — separated from ordinary public files)
-* **JS secret scan** — fetches every `.js` URL via httpx's native `-extract-regex` (no hand-rolled curl loop) and checks it against known secret formats (AWS/Google/Stripe/Slack/GitHub keys, JWTs, private key blocks, generic `api_key=` assignments)
-* **nuclei** — a host-level `severity:critical` sweep, a dedicated CORS misconfig pass, a per-class pass scoped to generic parameter-injection templates (not every CVE template with that tag — measured 67x fewer requests than unrestricted tag matching, same real coverage), and a subdomain-takeover pass (73 templates) — DoS-tagged templates always excluded via `-etags dos`, since most programs prohibit DoS testing
-* **Manual-testing queue** + optional Caido proxy warm-up for everything nuclei can't fingerprint on its own (IDOR, feature-flag logic, confirmed secrets, possible takeovers, "worth a closer look" params)
-* **Run-over-run diff** — every run is compared against the last one for the same target; `RECOMMENDATIONS.md` leads with a "New Since Last Run" section so re-running against a program you're already watching doesn't mean re-reading everything
-* A data-driven `RECOMMENDATIONS.md` — only shows guidance for classes that actually had candidates, not static boilerplate
-* **One live progress bar per phase** — on a real terminal, each tool's status redraws in place (no scrollback spam); when output is piped/redirected/logged (where in-place redraw doesn't survive), it automatically falls back to a handful of milestone lines instead of a wall of `\r`-broken fragments
+- **Recon** (`recon.py`) — subdomain discovery from 7 sources, run concurrently (hackertarget, agniops, subfinder, urlscan, assetfinder, findomain, subfaster), alive-host detection, DNS resolution, HTTP fingerprinting, port discovery, katana crawling and waymore historical URLs merged and scope-filtered, and parameter discovery (URL-derived plus paramspider, parallelized across `--param-jobs` workers)
+- **Scope filter** *(optional, `--scope-file`)* — drops anything outside an explicit in-scope allowlist before a single request goes out to fuzzing, JS scanning, or Caido
+- **GF pattern triage** — buckets endpoints and params into vuln-class candidates (xss, sqli, ssrf, lfi, rce, ssti, redirect, idor, interestingparams, debug_logic, img-traversal)
+- **Live-exposure check** with high-risk extension filtering (`.git`, `.env`, `.sql`, `.bak`, etc. — separated from ordinary public files)
+- **JS secret scan** — fetches every `.js` URL via httpx's native `-extract-regex` (no hand-rolled curl loop) and checks it against known secret formats (AWS/Google/Stripe/Slack/GitHub keys, JWTs, private key blocks, generic `api_key=` assignments)
+- **nuclei** — a host-level `severity:critical` sweep, a dedicated CORS misconfig pass, a per-class pass scoped to generic parameter-injection templates (not every CVE template with that tag — measured 67x fewer requests than unrestricted tag matching, same real coverage), and a subdomain-takeover pass (73 templates). DoS-tagged templates are always excluded via `-etags dos`, since most programs prohibit DoS testing
+- **Manual-testing queue** with optional Caido proxy warm-up for everything nuclei can't fingerprint on its own (IDOR, feature-flag logic, confirmed secrets, possible takeovers, "worth a closer look" params)
+- **Run-over-run diff** — every run is compared against the last one for the same target; `RECOMMENDATIONS.md` leads with a "New Since Last Run" section so re-running against a program you're already watching doesn't mean re-reading everything
+- A data-driven `RECOMMENDATIONS.md` that only shows guidance for classes that actually had candidates, not static boilerplate
+- **One live progress bar per phase** — on a real terminal, each tool's status redraws in place with no scrollback spam; when output is piped, redirected, or logged (where in-place redraw doesn't survive), it automatically falls back to a handful of milestone lines instead of a wall of broken fragments
 
 ### Workflow
 
@@ -63,7 +61,7 @@ recon.py — subdomains → alive → DNS → ports → crawl+waymore → params
 
 ---
 
-## 📦 Installation
+## Installation
 
 ```bash
 chmod +x Installer.sh && ./Installer.sh
@@ -73,7 +71,7 @@ The installer sets up everything: Go, the recon toolchain (subfinder/httpx/dnsx/
 
 ---
 
-## 🚀 Usage
+## Usage
 
 | Flag | Description |
 | --- | --- |
@@ -83,18 +81,18 @@ The installer sets up everything: Go, the recon toolchain (subfinder/httpx/dnsx/
 | `--indir` | Point at a custom output dir (default: `results/<target>` or `$OUTDIR`) |
 | `--param-jobs` | Parallel paramspider workers during recon (default: 5) |
 | `--scope-file` | One in-scope domain per line (apex or `*.sub.domain`). Filters `all_urls.txt` and `fresh_alive_domains` before anything downstream touches them |
-| `--rate` | nuclei/httpx `-rate-limit` (default: 50 — this is live production infra, not a lab box) |
+| `--rate` | nuclei/httpx `-rate-limit` (default: 50 — this is live production infrastructure, not a lab box) |
 | `--caido-proxy` | Caido proxy address (default: `http://127.0.0.1:8080`) |
 | `--caido-timeout` | Per-request curl `--max-time` for the Caido warm-up, seconds (default: 10) |
 | `--caido-delay` | Delay between Caido warm-up requests, seconds (default: 0.2) |
 | `--no-caido-warmup` | Build `manual_review.txt` but don't route it through Caido (also drops the `curl` requirement, since that's its only caller) |
 | `--no-js-scan` | Skip fetching `.js` files and scanning them for hardcoded secrets |
-| `--no-host-scan` | Skip the all-host `severity:critical` CVE/misconfig sweep — the expensive one (~1,870 templates × every alive host, hours on a large target). CORS, takeover, and per-class fuzzing passes still run and are the faster, higher-signal ones anyway |
+| `--no-host-scan` | Skip the all-host `severity:critical` CVE/misconfig sweep — the expensive one (roughly 1,870 templates times every alive host, hours on a large target). CORS, takeover, and per-class fuzzing passes still run and are the faster, higher-signal ones anyway |
 | `--discord` | Send a clean one-line summary via `notify` when done (requires a configured provider at `~/.config/notify/provider-config.yaml`) |
 | `-v, --verbose` | Verbose logging (debug-level subprocess command traces) |
 | `--quiet` | Suppress the startup banner |
 
-### Full pipeline (recon → triage → nuclei → Caido queue)
+### Full pipeline (recon, triage, nuclei, Caido queue)
 
 ```bash
 talon -t example.com
@@ -110,7 +108,7 @@ talon -l domains.txt
 
 ```bash
 export TARGET=example.com
-talon -t $TARGET             # runs recon + triage
+talon -t $TARGET                # runs recon + triage
 talon -t $TARGET --skip-recon   # later — triage only, reusing results/$TARGET
 ```
 
@@ -125,7 +123,7 @@ talon -t example.com --no-caido-warmup
 ```bash
 talon -t example.com --no-host-scan
 ```
-Keeps the CORS, takeover, and per-class fuzzing passes (typically finish in a few hours even on a large scope) and drops only the exhaustive every-host-x-every-critical-template sweep, which scales linearly with host count and can run for many hours on a target with 1,000+ alive hosts.
+Keeps the CORS, takeover, and per-class fuzzing passes (typically finish in a few hours even on a large scope) and drops only the exhaustive every-host-by-every-critical-template sweep, which scales linearly with host count and can run for many hours on a target with 1,000+ alive hosts.
 
 ### Restrict everything to an explicit scope list
 
@@ -148,7 +146,7 @@ talon -t example.com   # a week later
 
 ---
 
-## 📄 Output
+## Output
 
 Everything lands in `results/<target>/`:
 
@@ -159,8 +157,8 @@ Everything lands in `results/<target>/`:
 | `resolved_dns` | DNS-resolved hosts (dnsx) |
 | `tech_domains` | HTTP fingerprint data (status/title/server/tech-detect) |
 | `naabu.txt` | Open-port scan results |
-| `endpoints.txt` | Crawled (katana) + historical (waymore) URLs, merged, deduped, scope-filtered |
-| `params/all.txt` | URL-derived params + paramspider output, merged |
+| `endpoints.txt` | Crawled (katana) and historical (waymore) URLs, merged, deduped, scope-filtered |
+| `params/all.txt` | URL-derived params plus paramspider output, merged |
 
 And in `results/<target>/triage/`:
 
@@ -183,30 +181,28 @@ And in `results/<target>/triage/`:
 
 ---
 
-## 🧰 Tools
+## Tools
 
 Talon shells out to:
 
 **Recon** — subfinder, httpx, dnsx, naabu, katana, assetfinder, findomain, subfaster, waymore, paramspider, anew
-**Triage** — gf (needs `~/.gf` populated, see below), nuclei, httpx, anew, and curl *(only required unless `--no-caido-warmup` is set — it's the only thing that calls curl)*
-**Optional** — notify *(only used with `--discord`)*
+**Triage** — gf (needs `~/.gf` populated, see below), nuclei, httpx, anew, and curl (only required unless `--no-caido-warmup` is set, since that's the only thing that calls curl)
+**Optional** — notify (only used with `--discord`)
 
 GF ships with zero patterns of its own — `Installer.sh` clones [1ndianl33t/Gf-Patterns](https://github.com/1ndianl33t/Gf-Patterns) into `~/.gf` if it's not already there.
 
 ---
 
-## 🦅 Why Talon?
+## Why Talon
 
-Recon tools stop at raw hosts and URLs. Working out which parameters actually look exploitable, which nuclei templates to point at them, and what's left for a human used to mean stitching together a separate recon tool and a page of one-liners by hand. Talon collapses that into one command with one dependency chain.
+Recon tools stop at raw hosts and URLs. Working out which parameters actually look exploitable, which nuclei templates to point at them, and what's left for a human otherwise means stitching together a separate recon tool and a page of one-liners by hand. Talon collapses that into one command with one dependency chain.
 
 ```text
 DOMAIN → RECON → TRIAGE → SCAN → RECOMMEND
 ```
 
-**❤️ One tool. Domain in, triaged findings out.**
-
 ---
 
-## ⚠️ Authorization
+## Authorization
 
-Talon is intended for **authorized security testing only** — bug bounty programs in scope, security labs, or systems you own or have explicit permission to test. It runs live recon, live nuclei scans, and routes traffic through a proxy against real hosts; treat `--rate` accordingly.
+Talon is intended for authorized security testing only — bug bounty programs in scope, security labs, or systems you own or have explicit permission to test. It runs live recon, live nuclei scans, and routes traffic through a proxy against real hosts; treat `--rate` accordingly.
