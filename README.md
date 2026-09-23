@@ -206,3 +206,9 @@ DOMAIN → RECON → TRIAGE → SCAN → RECOMMEND
 ## Authorization
 
 Talon is intended for authorized security testing only — bug bounty programs in scope, security labs, or systems you own or have explicit permission to test. It runs live recon, live nuclei scans, and routes traffic through a proxy against real hosts; treat `--rate` accordingly.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
