@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+
+# Talon run output
+results/
+triage/
+*.jsonl
+
+# Local virtualenv (created by Installer.sh)
+.talon-venv/
+
+# Editor/OS cruft
+.DS_Store
+*.swp
