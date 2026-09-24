@@ -191,10 +191,10 @@ def banner():
 
 
 def run_recon_pipeline(target: str | None, list_file: str | None, outdir: Path, param_jobs: int,
-                        headers: list[str] | None = None) -> Path:
+                        headers: list[str] | None = None, rate: int = 50) -> Path:
     phase("RECON — subdomains → alive → DNS → ports → crawl → params")
     try:
-        result_dir = recon.run_full_recon(target, list_file, outdir, param_jobs=param_jobs, headers=headers)
+        result_dir = recon.run_full_recon(target, list_file, outdir, param_jobs=param_jobs, headers=headers, rate=rate)
     except ValueError as e:
         die(str(e))
     success("Recon complete")
@@ -828,7 +828,7 @@ def main():
     )
     parser.add_argument("--caido-proxy", default="http://127.0.0.1:8080", help="Caido proxy address (default: http://127.0.0.1:8080)")
     parser.add_argument("--caido-timeout", type=int, default=10, help="Per-request curl --max-time for the Caido warm-up (default: 10)")
-    parser.add_argument("--caido-delay", type=float, default=0.2, help="Delay between Caido warm-up requests, seconds (default: 0.2)")
+    parser.add_argument("--caido-delay", type=float, default=None, help="Delay between Caido warm-up requests, seconds (default: derived from --rate, so the warm-up never exceeds the same requests/sec ceiling as everything else)")
     parser.add_argument("--no-caido-warmup", action="store_true", help="Build manual_review.txt but don't route it through Caido")
     parser.add_argument("--no-js-scan", action="store_true", help="Skip fetching JS files and scanning them for hardcoded secrets")
     parser.add_argument("--no-host-scan", action="store_true", help="Skip the all-host severity:critical CVE/misconfig sweep (the slow one — ~1,870 templates x every alive host). CORS, takeover, and per-class fuzzing passes still run.")
@@ -853,7 +853,7 @@ def main():
     outdir = resolve_outdir(outdir_target, args.indir)
 
     if not args.skip_recon:
-        run_recon_pipeline(args.target, args.list_file, outdir, args.param_jobs, args.headers)
+        run_recon_pipeline(args.target, args.list_file, outdir, args.param_jobs, args.headers, args.rate)
     else:
         info(f"--skip-recon set — reusing existing results for {target_label}")
 
@@ -952,7 +952,10 @@ def main():
 
     warmed_up = False
     if manual_count and not args.no_caido_warmup:
-        caido_warmup(manual_path, args.caido_proxy, args.caido_timeout, args.caido_delay, args.headers)
+        # 1/rate keeps this phase's pacing consistent with -rate-limit
+        # everywhere else in the pipeline, unless the caller overrode it.
+        caido_delay = args.caido_delay if args.caido_delay is not None else 1.0 / max(args.rate, 1)
+        caido_warmup(manual_path, args.caido_proxy, args.caido_timeout, caido_delay, args.headers)
         warmed_up = True
     elif args.no_caido_warmup:
         info("--no-caido-warmup set — leaving manual_review.txt for you to import by hand")

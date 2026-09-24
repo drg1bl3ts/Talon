@@ -276,19 +276,19 @@ def discover_subdomains(targets: list[str], targets_file: Path, outdir: Path) ->
 # ALIVE / DNS / PORTS
 # ──────────────────────────────────────────────────────────────
 
-def alive_check(subs_path: Path, outdir: Path, headers: list[str] | None = None) -> Path:
+def alive_check(subs_path: Path, outdir: Path, headers: list[str] | None = None, rate: int = 50) -> Path:
     phase("ALIVE HOST DETECTION")
     alive_path = outdir / "fresh_alive_domains"
     alive_path.touch()
     run_piped_to_anew(
-        ["httpx", "-l", str(subs_path), "-silent", "-threads", "200"] + header_args(headers),
+        ["httpx", "-l", str(subs_path), "-silent", "-threads", "200", "-rate-limit", str(rate)] + header_args(headers),
         alive_path, "httpx:alive", total=count_lines(subs_path),
     )
     tech_path = outdir / "tech_domains"
     run_to_file(
         [
             "httpx", "-l", str(alive_path), "--status-code",
-            "--title", "--server", "-tech-detect", "-cl",
+            "--title", "--server", "-tech-detect", "-cl", "-rate-limit", str(rate),
         ] + header_args(headers),
         tech_path, "httpx:fingerprint", total=count_lines(alive_path),
     )
@@ -335,7 +335,7 @@ def _url_host(line: str) -> str:
     return line.split("/")[0].split(":")[0].lower()
 
 
-def crawl_and_collect_urls(targets: list[str], outdir: Path, tmpdir: Path, headers: list[str] | None = None) -> Path:
+def crawl_and_collect_urls(targets: list[str], outdir: Path, tmpdir: Path, headers: list[str] | None = None, rate: int = 50) -> Path:
     phase("CRAWLING / URL COLLECTION")
 
     katana_targets = tmpdir / "katana_targets.txt"
@@ -346,10 +346,13 @@ def crawl_and_collect_urls(targets: list[str], outdir: Path, tmpdir: Path, heade
     # katana writes to katana_out itself via -o, so no outfile capture here —
     # the bar just fills at elapsed/timeout since crawl depth has no fixed
     # total, and partial results still land in katana_out if it's killed.
+    # -rl (requests/sec) is the actual pacing control — -c/-p just cap how
+    # many goroutines/pages CAN run concurrently, so leaving them at 50 is
+    # harmless even at a low -rl; -rl is always the real bottleneck.
     run_with_deadline_progress(
         [
             "katana", "-list", str(katana_targets), "-jc", "-c", "50",
-            "-p", "50", "-rl", "200", "-timeout", "3",
+            "-p", "50", "-rl", str(rate), "-timeout", "3",
             "-o", str(katana_out), "-silent",
         ] + header_args(headers),
         "katana:crawl", timeout=300,
@@ -460,7 +463,7 @@ def param_discovery(endpoints_path: Path, alive_path: Path, outdir: Path, jobs: 
 # ──────────────────────────────────────────────────────────────
 
 def run_full_recon(target: str | None, list_file: str | None, outdir: Path,
-                    param_jobs: int = 5, headers: list[str] | None = None) -> Path:
+                    param_jobs: int = 5, headers: list[str] | None = None, rate: int = 50) -> Path:
     """Runs the complete recon pipeline directly against the underlying
     tools, writing results into `outdir` in the layout Talon's triage
     stage expects. Returns outdir.
@@ -468,7 +471,10 @@ def run_full_recon(target: str | None, list_file: str | None, outdir: Path,
     `headers` (e.g. "X-HackerOne-Researcher: yourname") is passed to every
     tool call that sends live HTTP requests at the target (httpx, katana) —
     not to the passive third-party recon APIs (hackertarget/agniops/urlscan)
-    or paramspider, which has no -H equivalent."""
+    or paramspider, which has no -H equivalent. `rate` (requests/sec) is
+    passed to the same httpx/katana calls — every phase that touches the
+    live target respects one consistent ceiling, not just triage's nuclei
+    passes."""
     which_or_die(RECON_TOOLS)
 
     targets, label = load_targets(target, list_file)
@@ -485,10 +491,10 @@ def run_full_recon(target: str | None, list_file: str | None, outdir: Path,
         targets_file.write_text("\n".join(targets) + "\n")
 
         subs_path = discover_subdomains(targets, targets_file, outdir)
-        alive_path = alive_check(subs_path, outdir, headers)
+        alive_path = alive_check(subs_path, outdir, headers, rate)
         resolved_path = dns_enumeration(alive_path, outdir)
         port_discovery(resolved_path, outdir)
-        endpoints_path = crawl_and_collect_urls(targets, outdir, tmpdir, headers)
+        endpoints_path = crawl_and_collect_urls(targets, outdir, tmpdir, headers, rate)
         param_discovery(endpoints_path, alive_path, outdir, jobs=param_jobs)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
