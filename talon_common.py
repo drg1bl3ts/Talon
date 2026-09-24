@@ -46,6 +46,17 @@ def die(msg, code=1):
     sys.exit(code)
 
 
+def header_args(headers: list[str] | None) -> list[str]:
+    """Expands a list of 'Name: Value' strings into repeated -H flags — the
+    format httpx, nuclei, katana, and curl all share for custom headers."""
+    if not headers:
+        return []
+    args = []
+    for h in headers:
+        args += ["-H", h]
+    return args
+
+
 def which_or_die(tools):
     import shutil
     missing = [t for t in tools if shutil.which(t) is None]

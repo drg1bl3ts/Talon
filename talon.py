@@ -46,7 +46,7 @@ from talon_common import (
     RESET, BOLD, DIM, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN,
     log, ts, info, phase, success, warn, error, detail, die,
     which_or_die, run, count_lines, Progress, run_with_spinner, run_to_file,
-    pipe_to_anew,
+    pipe_to_anew, header_args,
 )
 
 # --- Only scan assets you are authorised to test. ---
@@ -190,10 +190,11 @@ def banner():
     print(RESET)
 
 
-def run_recon_pipeline(target: str | None, list_file: str | None, outdir: Path, param_jobs: int) -> Path:
+def run_recon_pipeline(target: str | None, list_file: str | None, outdir: Path, param_jobs: int,
+                        headers: list[str] | None = None) -> Path:
     phase("RECON — subdomains → alive → DNS → ports → crawl → params")
     try:
-        result_dir = recon.run_full_recon(target, list_file, outdir, param_jobs=param_jobs)
+        result_dir = recon.run_full_recon(target, list_file, outdir, param_jobs=param_jobs, headers=headers)
     except ValueError as e:
         die(str(e))
     success("Recon complete")
@@ -303,7 +304,7 @@ def gf_triage(all_urls: Path, triage_dir: Path) -> dict:
     return counts
 
 
-def check_interesting_ext_live(triage_dir: Path, rate: int) -> int:
+def check_interesting_ext_live(triage_dir: Path, rate: int, headers: list[str] | None = None) -> int:
     candidates = triage_dir / f"{EXT_CLASS['slug']}_candidates.txt"
     live = triage_dir / "interestingEXT_live.txt"
     total = count_lines(candidates)
@@ -311,7 +312,7 @@ def check_interesting_ext_live(triage_dir: Path, rate: int) -> int:
         live.touch()
         return 0
     run_to_file(
-        ["httpx", "-l", str(candidates), "-silent", "-mc", "200", "-rate-limit", str(rate)],
+        ["httpx", "-l", str(candidates), "-silent", "-mc", "200", "-rate-limit", str(rate)] + header_args(headers),
         live, "httpx:interestingEXT", total=total,
     )
     return count_lines(live)
@@ -346,7 +347,7 @@ def extract_js_urls(all_urls: Path, triage_dir: Path) -> tuple[Path, int]:
     return out, len(lines)
 
 
-def js_secret_scan(js_urls: Path, triage_dir: Path, rate: int) -> tuple[Path, list]:
+def js_secret_scan(js_urls: Path, triage_dir: Path, rate: int, headers: list[str] | None = None) -> tuple[Path, list]:
     """Fetches every JS file via httpx's native -extract-regex and checks the
     body against SECRET_PATTERNS. One httpx process, properly rate-limited —
     no hand-rolled curl loop."""
@@ -357,7 +358,7 @@ def js_secret_scan(js_urls: Path, triage_dir: Path, rate: int) -> tuple[Path, li
     cmd = [
         "httpx", "-duc", "-l", str(js_urls), "-silent", "-json",
         "-timeout", "10", "-rate-limit", str(rate),
-    ]
+    ] + header_args(headers)
     for _, pattern in SECRET_PATTERNS:
         cmd += ["-er", pattern]
 
@@ -403,7 +404,7 @@ def js_secret_scan(js_urls: Path, triage_dir: Path, rate: int) -> tuple[Path, li
 NUCLEI_STATS_FLAGS = ["-stats", "-stats-json", "-stats-interval", "2"]
 
 
-def nuclei_host_scan(alive: Path, nuclei_dir: Path, rate: int) -> Path | None:
+def nuclei_host_scan(alive: Path, nuclei_dir: Path, rate: int, headers: list[str] | None = None) -> Path | None:
     """severity:critical, not medium,high,critical — measured directly:
     medium,high,critical loads 6,565 templates (basically the whole default
     library minus info-level) at ~15,976 requests/host. Across 1,274 alive
@@ -422,28 +423,28 @@ def nuclei_host_scan(alive: Path, nuclei_dir: Path, rate: int) -> Path | None:
     cmd = [
         "nuclei", "-silent", "-l", str(alive), "-severity", "critical",
         "-etags", "dos", "-rate-limit", str(rate), "-jsonl", "-o", str(out),
-    ] + NUCLEI_STATS_FLAGS
+    ] + header_args(headers) + NUCLEI_STATS_FLAGS
     returncode = run_nuclei_with_progress(cmd, "nuclei:host")
     if returncode != 0:
         warn(f"nuclei host-level pass exited {returncode}")
     return out if out.exists() else None
 
 
-def nuclei_cors_scan(alive: Path, nuclei_dir: Path, rate: int) -> Path | None:
+def nuclei_cors_scan(alive: Path, nuclei_dir: Path, rate: int, headers: list[str] | None = None) -> Path | None:
     """CORS misconfig template is severity:info, so it never survives the
     host-level medium/high/critical filter — give it its own tag-scoped pass."""
     out = nuclei_dir / "nuclei_cors.jsonl"
     cmd = [
         "nuclei", "-silent", "-l", str(alive), "-tags", "cors",
         "-etags", "dos", "-rate-limit", str(rate), "-jsonl", "-o", str(out),
-    ] + NUCLEI_STATS_FLAGS
+    ] + header_args(headers) + NUCLEI_STATS_FLAGS
     returncode = run_nuclei_with_progress(cmd, "nuclei:cors")
     if returncode != 0:
         warn(f"nuclei CORS pass exited {returncode}")
     return out if out.exists() else None
 
 
-def nuclei_takeover_scan(alive: Path, nuclei_dir: Path, rate: int) -> Path | None:
+def nuclei_takeover_scan(alive: Path, nuclei_dir: Path, rate: int, headers: list[str] | None = None) -> Path | None:
     """73 templates, all tagged `takeover`, severity high — checks for the
     dangling-CNAME fingerprint pattern (S3 NoSuchBucket, Heroku 'no such app',
     GitHub Pages, etc.). fresh_alive_domains is the right input: httpx already
@@ -453,14 +454,14 @@ def nuclei_takeover_scan(alive: Path, nuclei_dir: Path, rate: int) -> Path | Non
     cmd = [
         "nuclei", "-silent", "-l", str(alive), "-tags", "takeover",
         "-etags", "dos", "-rate-limit", str(rate), "-jsonl", "-o", str(out),
-    ] + NUCLEI_STATS_FLAGS
+    ] + header_args(headers) + NUCLEI_STATS_FLAGS
     returncode = run_nuclei_with_progress(cmd, "nuclei:takeover")
     if returncode != 0:
         warn(f"nuclei takeover pass exited {returncode}")
     return out if out.exists() else None
 
 
-def nuclei_class_scans(triage_dir: Path, nuclei_dir: Path, rate: int) -> list:
+def nuclei_class_scans(triage_dir: Path, nuclei_dir: Path, rate: int, headers: list[str] | None = None) -> list:
     outputs = []
     for cls in FUZZ_CLASSES:
         candidates = triage_dir / f"{cls['slug']}_candidates.txt"
@@ -470,7 +471,7 @@ def nuclei_class_scans(triage_dir: Path, nuclei_dir: Path, rate: int) -> list:
         cmd = [
             "nuclei", "-silent", "-l", str(candidates), "-tags", cls["tags"],
             "-etags", "dos", "-rate-limit", str(rate), "-jsonl", "-o", str(out),
-        ]
+        ] + header_args(headers)
         if cls["templates"]:
             cmd += ["-t", cls["templates"]]
         cmd += NUCLEI_STATS_FLAGS
@@ -521,7 +522,7 @@ def build_manual_review(triage_dir: Path) -> tuple[Path, int]:
     return out, len(lines)
 
 
-def caido_warmup(manual_review: Path, proxy: str, timeout: int, delay: float):
+def caido_warmup(manual_review: Path, proxy: str, timeout: int, delay: float, headers: list[str] | None = None):
     urls = [l for l in manual_review.read_text().splitlines() if l.strip()]
     if not urls:
         return
@@ -530,7 +531,7 @@ def caido_warmup(manual_review: Path, proxy: str, timeout: int, delay: float):
     for i, url in enumerate(urls, 1):
         progress.update(f"{i}/{len(urls)} URLs", percent=100 * (i - 1) / len(urls))
         run(
-            ["curl", "-sk", "--max-time", str(timeout), "-x", proxy, url, "-o", "/dev/null"],
+            ["curl", "-sk", "--max-time", str(timeout), "-x", proxy] + header_args(headers) + [url, "-o", "/dev/null"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -771,6 +772,13 @@ def main():
     parser.add_argument("--param-jobs", type=int, default=5, help="Parallel paramspider workers during recon (default: 5)")
     parser.add_argument("--scope-file", default=None, help="One in-scope domain per line (apex or subdomain). Filters every URL/host list before any of it gets fuzzed, JS-scanned, or routed through Caido.")
     parser.add_argument("--rate", type=int, default=50, help="nuclei -rate-limit (default: 50)")
+    parser.add_argument(
+        "-H", "--header", dest="headers", action="append", default=[],
+        metavar="'Name: Value'",
+        help="Custom header added to every live HTTP request Talon makes — recon (httpx/katana), "
+             "triage (httpx/nuclei), and the Caido warm-up (curl). Repeatable. "
+             "e.g. -H 'X-HackerOne-Researcher: yourname'",
+    )
     parser.add_argument("--caido-proxy", default="http://127.0.0.1:8080", help="Caido proxy address (default: http://127.0.0.1:8080)")
     parser.add_argument("--caido-timeout", type=int, default=10, help="Per-request curl --max-time for the Caido warm-up (default: 10)")
     parser.add_argument("--caido-delay", type=float, default=0.2, help="Delay between Caido warm-up requests, seconds (default: 0.2)")
@@ -798,7 +806,7 @@ def main():
     outdir = resolve_outdir(outdir_target, args.indir)
 
     if not args.skip_recon:
-        run_recon_pipeline(args.target, args.list_file, outdir, args.param_jobs)
+        run_recon_pipeline(args.target, args.list_file, outdir, args.param_jobs, args.headers)
     else:
         info(f"--skip-recon set — reusing existing results for {target_label}")
 
@@ -839,7 +847,7 @@ def main():
     for cls in GF_ALL:
         detail(f"{cls['slug']}: {gf_counts[cls['slug']]}")
 
-    ext_live_count = check_interesting_ext_live(triage_dir, args.rate)
+    ext_live_count = check_interesting_ext_live(triage_dir, args.rate, args.headers)
     dangerous_count = 0
     if ext_live_count:
         _, dangerous_count = filter_dangerous_ext(triage_dir)
@@ -855,7 +863,7 @@ def main():
         js_urls, js_count = extract_js_urls(all_urls, triage_dir)
         if js_count:
             info(f"{js_count} JS file(s) found — checking for hardcoded secrets")
-            _, secret_findings = js_secret_scan(js_urls, triage_dir, args.rate)
+            _, secret_findings = js_secret_scan(js_urls, triage_dir, args.rate, args.headers)
             if secret_findings:
                 warn(f"{len(secret_findings)} potential secret(s) found in JS — see triage/js_secrets.txt")
             else:
@@ -870,16 +878,16 @@ def main():
         info("--no-host-scan set — skipping the all-host CVE/misconfig sweep")
         host_out = None
     else:
-        host_out = nuclei_host_scan(alive_path, nuclei_dir, args.rate)
-    cors_out = nuclei_cors_scan(alive_path, nuclei_dir, args.rate)
+        host_out = nuclei_host_scan(alive_path, nuclei_dir, args.rate, args.headers)
+    cors_out = nuclei_cors_scan(alive_path, nuclei_dir, args.rate, args.headers)
     cors_findings = parse_nuclei_jsonl([cors_out] if cors_out else [])
-    class_outs = nuclei_class_scans(triage_dir, nuclei_dir, args.rate)
+    class_outs = nuclei_class_scans(triage_dir, nuclei_dir, args.rate, args.headers)
     all_paths = ([host_out] if host_out else []) + [p for _, p in class_outs]
     findings = parse_nuclei_jsonl(all_paths) + cors_findings
     success(f"nuclei complete — {len(findings)} finding(s)")
 
     phase("SUBDOMAIN TAKEOVER CHECK")
-    takeover_out = nuclei_takeover_scan(alive_path, nuclei_dir, args.rate)
+    takeover_out = nuclei_takeover_scan(alive_path, nuclei_dir, args.rate, args.headers)
     takeover_findings = parse_nuclei_jsonl([takeover_out] if takeover_out else [])
     if takeover_findings:
         warn(f"{len(takeover_findings)} possible takeover(s) — verify manually before claiming, see triage/nuclei/nuclei_takeover.jsonl")
@@ -897,7 +905,7 @@ def main():
 
     warmed_up = False
     if manual_count and not args.no_caido_warmup:
-        caido_warmup(manual_path, args.caido_proxy, args.caido_timeout, args.caido_delay)
+        caido_warmup(manual_path, args.caido_proxy, args.caido_timeout, args.caido_delay, args.headers)
         warmed_up = True
     elif args.no_caido_warmup:
         info("--no-caido-warmup set — leaving manual_review.txt for you to import by hand")
