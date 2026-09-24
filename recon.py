@@ -93,7 +93,7 @@ def load_targets(target: str | None, list_file: str | None) -> tuple[list[str], 
         candidates = parse_scope_csv(path)
     else:
         candidates = []
-        for raw in path.read_text().splitlines():
+        for raw in path.read_text(errors="ignore").splitlines():
             line = raw.split("#", 1)[0].strip().lower()
             if line:
                 candidates.append(line)
@@ -409,7 +409,7 @@ def param_discovery(endpoints_path: Path, alive_path: Path, outdir: Path, jobs: 
     # limits, and it works even if paramspider is unavailable/throttled.
     from_urls = params_dir / "from_urls.txt"
     if endpoints_path.exists():
-        lines = [l for l in endpoints_path.read_text().splitlines() if "?" in l]
+        lines = [l for l in endpoints_path.read_text(errors="ignore").splitlines() if "?" in l]
     else:
         lines = []
     from_urls.write_text("\n".join(sorted(set(lines))) + ("\n" if lines else ""))
@@ -419,7 +419,7 @@ def param_discovery(endpoints_path: Path, alive_path: Path, outdir: Path, jobs: 
         domains = []
     else:
         domains = sorted({
-            _url_host(l) for l in alive_path.read_text().splitlines() if l.strip()
+            _url_host(l) for l in alive_path.read_text(errors="ignore").splitlines() if l.strip()
         })
         domains = [d for d in domains if d and _DOMAIN_RE.match(d)]
 

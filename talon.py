@@ -221,7 +221,7 @@ def load_scope(scope_file: Path) -> list[str]:
     if scope_file.suffix.lower() == ".csv":
         return parse_scope_csv(scope_file)
     domains = []
-    for line in scope_file.read_text().splitlines():
+    for line in scope_file.read_text(errors="ignore").splitlines():
         line = line.strip().lower()
         if not line or line.startswith("#"):
             continue
@@ -250,7 +250,7 @@ def filter_by_scope(src: Path, dst: Path, scope_domains: list[str]) -> tuple[Pat
         dst.touch()
         return dst, 0, 0
     kept, dropped = [], 0
-    for line in src.read_text().splitlines():
+    for line in src.read_text(errors="ignore").splitlines():
         if not line.strip():
             continue
         if in_scope(line_hostname(line), scope_domains):
@@ -327,7 +327,7 @@ def filter_dangerous_ext(triage_dir: Path) -> tuple[Path, int]:
         out.touch()
         return out, 0
     matches = [
-        line for line in live.read_text().splitlines()
+        line for line in live.read_text(errors="ignore").splitlines()
         if line.strip() and DANGEROUS_EXT_PATTERN.search(line)
     ]
     out.write_text("\n".join(matches) + ("\n" if matches else ""))
@@ -483,7 +483,7 @@ def dedupe_fuzz_candidates(candidates: Path, nuclei_dir: Path, slug: str) -> tup
     The original candidates file is left untouched (gf's raw match count is
     still meaningful context); only what nuclei actually scans is deduped.
     Returns (path_to_scan, original_count, deduped_count)."""
-    lines = [l.strip() for l in candidates.read_text().splitlines() if l.strip()]
+    lines = [l.strip() for l in candidates.read_text(errors="ignore").splitlines() if l.strip()]
     seen = {}
     for line in lines:
         seen.setdefault(_param_signature(line), line)
@@ -524,7 +524,7 @@ def parse_nuclei_jsonl(paths) -> list:
     for path in paths:
         if not path or not path.exists():
             continue
-        for line in path.read_text().splitlines():
+        for line in path.read_text(errors="ignore").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -552,14 +552,14 @@ def build_manual_review(triage_dir: Path) -> tuple[Path, int]:
     for name in files:
         p = triage_dir / name
         if p.exists():
-            lines.update(l.strip() for l in p.read_text().splitlines() if l.strip())
+            lines.update(l.strip() for l in p.read_text(errors="ignore").splitlines() if l.strip())
     out = triage_dir / "manual_review.txt"
     out.write_text("\n".join(sorted(lines)) + ("\n" if lines else ""))
     return out, len(lines)
 
 
 def caido_warmup(manual_review: Path, proxy: str, timeout: int, delay: float, headers: list[str] | None = None):
-    urls = [l for l in manual_review.read_text().splitlines() if l.strip()]
+    urls = [l for l in manual_review.read_text(errors="ignore").splitlines() if l.strip()]
     if not urls:
         return
     phase(f"CAIDO WARM-UP — routing {len(urls)} URLs through {proxy}")
@@ -958,9 +958,9 @@ def main():
         info("--no-caido-warmup set — leaving manual_review.txt for you to import by hand")
 
     phase("DIFF AGAINST LAST RUN")
-    dangerous_ext_list = (triage_dir / "interestingEXT_dangerous.txt").read_text().splitlines() \
+    dangerous_ext_list = (triage_dir / "interestingEXT_dangerous.txt").read_text(errors="ignore").splitlines() \
         if (triage_dir / "interestingEXT_dangerous.txt").exists() else []
-    manual_urls_list = manual_path.read_text().splitlines() if manual_path.exists() else []
+    manual_urls_list = manual_path.read_text(errors="ignore").splitlines() if manual_path.exists() else []
 
     prev_state = load_previous_state(triage_dir)
     if prev_state is None:

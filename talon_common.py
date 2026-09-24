@@ -132,9 +132,16 @@ def run(cmd, **kw):
 
 
 def count_lines(path) -> int:
+    # errors="ignore": these are tool-output files (httpx titles/server
+    # banners, crawled URLs, ...) scraping arbitrary live web content —
+    # not guaranteed valid UTF-8. A single bad byte on one line shouldn't
+    # crash line-counting over an otherwise-good file; count_lines() is
+    # called from dozens of places, several of them synchronous in the
+    # main thread, so an uncaught UnicodeDecodeError here kills the whole
+    # run rather than just one background progress bar.
     if not path.exists() or path.stat().st_size == 0:
         return 0
-    with path.open() as f:
+    with path.open(errors="ignore") as f:
         return sum(1 for line in f if line.strip())
 
 
