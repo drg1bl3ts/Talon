@@ -287,7 +287,7 @@ def alive_check(subs_path: Path, outdir: Path, headers: list[str] | None = None)
     tech_path = outdir / "tech_domains"
     run_to_file(
         [
-            "httpx", "-l", str(alive_path), "--random-agent", "--status-code",
+            "httpx", "-l", str(alive_path), "--status-code",
             "--title", "--server", "-tech-detect", "-cl",
         ] + header_args(headers),
         tech_path, "httpx:fingerprint", total=count_lines(alive_path),

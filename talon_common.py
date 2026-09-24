@@ -48,11 +48,26 @@ def die(msg, code=1):
     sys.exit(code)
 
 
+# A modern, ordinary-looking browser UA. Several real targets gate on
+# User-Agent alone — a WAF/bot-protection layer redirects or silently drops
+# anything that doesn't look like a browser (tool defaults like
+# "curl/8.4.0" or "nuclei" are trivial to filter on), which makes an
+# automated scan look "clean" when it never actually reached the app.
+# Update this string occasionally as Chrome's version ages, same as you'd
+# refresh any other browser-identifying fingerprint.
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+
+
 def header_args(headers: list[str] | None) -> list[str]:
     """Expands a list of 'Name: Value' strings into repeated -H flags — the
-    format httpx, nuclei, katana, and curl all share for custom headers."""
-    if not headers:
-        return []
+    format httpx, nuclei, katana, and curl all share for custom headers.
+    Always injects DEFAULT_USER_AGENT unless the caller already supplied
+    their own User-Agent (via --header), so every request Talon sends
+    presents as an ordinary browser by default instead of whatever each
+    tool's own default happens to be."""
+    headers = list(headers) if headers else []
+    if not any(h.split(":", 1)[0].strip().lower() == "user-agent" for h in headers):
+        headers = headers + [f"User-Agent: {DEFAULT_USER_AGENT}"]
     args = []
     for h in headers:
         args += ["-H", h]
