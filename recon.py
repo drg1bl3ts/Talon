@@ -39,7 +39,7 @@ from urllib.parse import urlparse
 
 from talon_common import (
     detail, error, info, phase, success, warn, ts, GREEN, RESET,
-    count_lines, run_to_file, run_piped_to_anew, run_with_deadline_progress,
+    count_lines, run_to_file, run_piped_to_anew, run_piped_to_anew_paced, run_with_deadline_progress,
     run_with_spinner, which_or_die, Progress, header_args, parse_scope_csv,
 )
 
@@ -280,9 +280,9 @@ def alive_check(subs_path: Path, outdir: Path, headers: list[str] | None = None,
     phase("ALIVE HOST DETECTION")
     alive_path = outdir / "fresh_alive_domains"
     alive_path.touch()
-    run_piped_to_anew(
+    run_piped_to_anew_paced(
         ["httpx", "-l", str(subs_path), "-silent", "-threads", "200", "-rate-limit", str(rate)] + header_args(headers),
-        alive_path, "httpx:alive", total=count_lines(subs_path),
+        alive_path, "httpx:alive", total=count_lines(subs_path), rate=rate,
     )
     tech_path = outdir / "tech_domains"
     run_to_file(

@@ -400,6 +400,44 @@ def run_piped_to_anew(cmd, anew_target, label: str, total: int | None = None) ->
     return result
 
 
+def run_piped_to_anew_paced(cmd, anew_target, label: str, total: int, rate: int) -> subprocess.CompletedProcess:
+    """Like run_piped_to_anew(), but for a call whose output is inherently
+    filtered — e.g. alive_check()'s httpx pass only ever prints a line for a
+    host that's actually alive, so anew_target's line count means "hosts
+    confirmed alive," not "hosts processed." On a large/mostly-dead
+    candidate list (a big subdomain sweep, say) that reads as stuck at
+    "0/31612" when it's actually most of the way through. Same elapsed-vs-
+    (total/rate) estimate as run_to_file_paced() — see _watch_elapsed_vs_rate()."""
+    progress = Progress(label)
+    stop_event = threading.Event()
+    watcher = threading.Thread(
+        target=_watch_elapsed_vs_rate, args=(Path(anew_target), total, rate, progress, stop_event), daemon=True,
+    )
+    watcher.start()
+
+    producer = subprocess.Popen(
+        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    consumer = subprocess.run(
+        ["anew", str(anew_target)],
+        stdin=producer.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    if producer.stdout:
+        producer.stdout.close()
+    producer.wait()
+
+    stop_event.set()
+    watcher.join(timeout=1)
+
+    result = subprocess.CompletedProcess(cmd, producer.returncode or consumer.returncode)
+    if result.returncode == 0:
+        progress.update("done", percent=100)
+        progress.stop(f"{GREEN}[{ts()}] ✓{RESET} {label} complete")
+    else:
+        progress.stop(f"{YELLOW}[{ts()}] !{RESET} {label} exited {result.returncode}")
+    return result
+
+
 def run_with_deadline_progress(cmd, label: str, timeout: float, outfile=None) -> subprocess.CompletedProcess:
     """For calls bounded by a hard timeout rather than a countable total
     (a crawl with no fixed target count): the bar fills at elapsed/timeout,
