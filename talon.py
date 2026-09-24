@@ -784,14 +784,25 @@ def discord_notify(target: str, url_count: int, secret_count: int, findings: lis
 
 
 def determine_target_and_label(target: str | None, list_file: str | None) -> tuple[str, str]:
-    """Returns (outdir_target, display_label). outdir_target is always a
-    single domain — the target itself, or the first valid domain from
-    --list (matching recon.py's default OUTDIR derivation)."""
+    """Returns (outdir_target, display_label), used by resolve_outdir() as
+    the results/<outdir_target> name when --indir/$OUTDIR aren't set.
+
+    For -t, outdir_target is just the target domain. For -l, it's the list
+    file's containing directory name rather than the first alphabetical
+    domain in it — --list workflows are typically one directory per
+    engagement (e.g. ~/work/coupang/domains.txt), and that folder name
+    reads far better as the results dir than an arbitrary domain would.
+    Falls back to the first domain if the list file has no meaningful
+    parent (e.g. it's at filesystem root)."""
     try:
         targets, label = recon.load_targets(target, list_file)
     except ValueError as e:
         die(str(e))
-    return targets[0], label
+    if list_file:
+        outdir_target = Path(list_file).resolve().parent.name or targets[0]
+    else:
+        outdir_target = targets[0]
+    return outdir_target, label
 
 
 def main():

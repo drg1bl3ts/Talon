@@ -78,7 +78,7 @@ The installer sets up everything: Go, the recon toolchain (subfinder/httpx/dnsx/
 | `-t, --target` | Single target domain |
 | `-l, --list` | File with one domain per line (multi-target) |
 | `--skip-recon` | Reuse an existing results dir instead of running Talon's own recon pipeline again |
-| `--indir` | Point at a custom output dir (default: `results/<target>` or `$OUTDIR`) |
+| `--indir` | Point at a custom output dir (default: `results/<target>` for `-t`, `results/<list-file's-directory-name>` for `-l`, or `$OUTDIR`) |
 | `--param-jobs` | Parallel paramspider workers during recon (default: 5) |
 | `--scope-file` | One in-scope domain per line (apex or `*.sub.domain`), or a HackerOne scope CSV export (`.csv` extension). Filters `all_urls.txt` and `fresh_alive_domains` before anything downstream touches them |
 | `--rate` | nuclei/httpx `-rate-limit` (default: 50 — this is live production infrastructure, not a lab box) |
