@@ -39,7 +39,7 @@ from urllib.parse import urlparse
 
 from talon_common import (
     detail, error, info, phase, success, warn, ts, GREEN, RESET,
-    count_lines, run_to_file, run_piped_to_anew, run_piped_to_anew_paced, run_with_deadline_progress,
+    count_lines, run_to_file, run_to_file_paced, run_piped_to_anew, run_piped_to_anew_paced, run_with_deadline_progress,
     run_with_spinner, which_or_die, Progress, header_args, parse_scope_csv,
 )
 
@@ -311,12 +311,22 @@ def dns_enumeration(alive_path: Path, outdir: Path) -> Path:
     return resolved_path
 
 
-def port_discovery(resolved_path: Path, outdir: Path) -> Path:
+def port_discovery(resolved_path: Path, outdir: Path, rate: int = 50) -> Path:
+    """naabu's own -rate is in packets/sec, not hosts/sec — pass Talon's
+    --rate through so this phase respects the same ceiling as every other
+    live-traffic call instead of running at naabu's uncapped 1000 pkt/s
+    default. -top-ports 100 means each host costs ~100 packets, so the
+    progress estimate below converts rate into hosts/sec (rate/100) before
+    handing it to run_to_file_paced() — same math, just re-based to match
+    naabu.txt's real unit (one line per open PORT found, not per host)."""
     phase("PORT DISCOVERY")
     naabu_path = outdir / "naabu.txt"
-    run_to_file(
-        ["naabu", "-l", str(resolved_path), "-silent", "-top-ports", "100"],
-        naabu_path, "naabu", total=count_lines(resolved_path),
+    total_hosts = count_lines(resolved_path)
+    ports_per_host = 100
+    hosts_per_sec = (rate / ports_per_host) if rate else 0
+    run_to_file_paced(
+        ["naabu", "-l", str(resolved_path), "-silent", "-top-ports", str(ports_per_host), "-rate", str(rate)],
+        naabu_path, "naabu", total=total_hosts, rate=hosts_per_sec,
     )
     count = count_lines(naabu_path)
     success("PORT DISCOVERY COMPLETE")
@@ -493,7 +503,7 @@ def run_full_recon(target: str | None, list_file: str | None, outdir: Path,
         subs_path = discover_subdomains(targets, targets_file, outdir)
         alive_path = alive_check(subs_path, outdir, headers, rate)
         resolved_path = dns_enumeration(alive_path, outdir)
-        port_discovery(resolved_path, outdir)
+        port_discovery(resolved_path, outdir, rate)
         endpoints_path = crawl_and_collect_urls(targets, outdir, tmpdir, headers, rate)
         param_discovery(endpoints_path, alive_path, outdir, jobs=param_jobs)
     finally:

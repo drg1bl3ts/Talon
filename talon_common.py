@@ -313,7 +313,7 @@ def run_to_file(cmd, outfile, label: str, total: int | None = None) -> subproces
     return result
 
 
-def _watch_elapsed_vs_rate(outfile: Path, total: int, rate: int, progress: Progress, stop_event: threading.Event,
+def _watch_elapsed_vs_rate(outfile: Path, total: int, rate: int | float, progress: Progress, stop_event: threading.Event,
                             poll_interval: float = 0.5):
     """For tools whose output is FILTERED (httpx -mc, naabu's open-ports-only
     output, ...) — outfile's line count there means "matches found," not
@@ -334,7 +334,7 @@ def _watch_elapsed_vs_rate(outfile: Path, total: int, rate: int, progress: Progr
         stop_event.wait(poll_interval)
 
 
-def run_to_file_paced(cmd, outfile, label: str, total: int, rate: int) -> subprocess.CompletedProcess:
+def run_to_file_paced(cmd, outfile, label: str, total: int, rate: int | float) -> subprocess.CompletedProcess:
     """Like run_to_file(), but for a filtered-output call (httpx -mc, etc.)
     where outfile's line count can't be used as a processed-item proxy —
     see _watch_elapsed_vs_rate(). `rate` must be the same -rate-limit value
@@ -400,7 +400,7 @@ def run_piped_to_anew(cmd, anew_target, label: str, total: int | None = None) ->
     return result
 
 
-def run_piped_to_anew_paced(cmd, anew_target, label: str, total: int, rate: int) -> subprocess.CompletedProcess:
+def run_piped_to_anew_paced(cmd, anew_target, label: str, total: int, rate: int | float) -> subprocess.CompletedProcess:
     """Like run_piped_to_anew(), but for a call whose output is inherently
     filtered — e.g. alive_check()'s httpx pass only ever prints a line for a
     host that's actually alive, so anew_target's line count means "hosts
