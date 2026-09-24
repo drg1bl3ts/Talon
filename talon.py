@@ -72,17 +72,29 @@ FUZZ_CLASSES = [
     {"slug": "sqli", "pattern": "sqli", "tags": "sqli", "templates": GENERIC_FUZZ_TEMPLATES},
     {"slug": "ssrf", "pattern": "ssrf", "tags": "ssrf", "templates": GENERIC_FUZZ_TEMPLATES},
     {"slug": "lfi", "pattern": "lfi", "tags": "lfi", "templates": GENERIC_FUZZ_TEMPLATES},
-    {"slug": "rce", "pattern": "rce", "tags": "rce", "templates": GENERIC_FUZZ_TEMPLATES},
     {"slug": "ssti", "pattern": "ssti", "tags": "ssti", "templates": None},
     {"slug": "img_traversal", "pattern": "img-traversal", "tags": "lfi,traversal", "templates": GENERIC_FUZZ_TEMPLATES},
     {"slug": "redirect", "pattern": "redirect", "tags": "redirect", "templates": GENERIC_FUZZ_TEMPLATES},
 ]
 
 # No generic nuclei signature exists for these — always a human decision.
+# rce lives here, not in FUZZ_CLASSES: GENERIC_FUZZ_TEMPLATES' two folders
+# contain exactly one rce-tagged template (header-command-injection.yaml),
+# and nuclei's own .nuclei-ignore excludes it by default (flagged upstream
+# as having weak/unreliable matchers) — so "-tags rce" scoped to those
+# folders always resolves to zero templates and fails identically on every
+# target. The alternative, dropping the folder restriction to use the
+# ~1,049 rce-tagged templates across the whole library, reintroduces
+# exactly what GENERIC_FUZZ_TEMPLATES exists to avoid: those are almost
+# all product-specific CVE checks, not generic parameter fuzzing. RCE
+# candidates get the same manual, OOB-callback-verified treatment as
+# every other class here — see RECOMMENDATIONS["rce"] below, which already
+# said this before the bug was found.
 MANUAL_CLASSES = [
     {"slug": "idor", "pattern": "idor"},
     {"slug": "interestingparams", "pattern": "interestingparams"},
     {"slug": "debug_logic", "pattern": "debug_logic"},
+    {"slug": "rce", "pattern": "rce"},
 ]
 
 # The exposure *is* the file existing — checked with httpx, not nuclei.
