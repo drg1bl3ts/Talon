@@ -313,6 +313,55 @@ def run_to_file(cmd, outfile, label: str, total: int | None = None) -> subproces
     return result
 
 
+def _watch_elapsed_vs_rate(outfile: Path, total: int, rate: int, progress: Progress, stop_event: threading.Event,
+                            poll_interval: float = 0.5):
+    """For tools whose output is FILTERED (httpx -mc, naabu's open-ports-only
+    output, ...) — outfile's line count there means "matches found," not
+    "items processed," so watching it the way _watch_line_count() does is
+    actively misleading: a low-hit-rate scan looks stalled at "1/8912" when
+    it's actually most of the way through. -rate-limit paces requests
+    deterministically, so elapsed-time-vs-(total/rate) is the accurate
+    estimate of how far through `total` we are — same 99%-cap-until-actual-
+    exit convention as every other progress helper here."""
+    start = time.time()
+    expected = total / rate if rate else 0
+    while not stop_event.is_set():
+        elapsed = time.time() - start
+        pct = min(99.0, 100.0 * elapsed / expected) if expected else 0.0
+        matched = count_lines(outfile) if outfile.exists() else 0
+        est_done = min(int(elapsed * rate), total)
+        progress.update(f"~{est_done}/{total} checked, {matched} match(es)", percent=pct)
+        stop_event.wait(poll_interval)
+
+
+def run_to_file_paced(cmd, outfile, label: str, total: int, rate: int) -> subprocess.CompletedProcess:
+    """Like run_to_file(), but for a filtered-output call (httpx -mc, etc.)
+    where outfile's line count can't be used as a processed-item proxy —
+    see _watch_elapsed_vs_rate(). `rate` must be the same -rate-limit value
+    passed to `cmd` for the time estimate to track reality."""
+    progress = Progress(label)
+    stop_event = threading.Event()
+    watcher = threading.Thread(
+        target=_watch_elapsed_vs_rate, args=(Path(outfile), total, rate, progress, stop_event), daemon=True,
+    )
+    watcher.start()
+
+    with open(outfile, "wb") as f:
+        result = subprocess.run(
+            cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.DEVNULL,
+        )
+
+    stop_event.set()
+    watcher.join(timeout=1)
+
+    if result.returncode == 0:
+        progress.update("done", percent=100)
+        progress.stop(f"{GREEN}[{ts()}] ✓{RESET} {label} complete")
+    else:
+        progress.stop(f"{YELLOW}[{ts()}] !{RESET} {label} exited {result.returncode}")
+    return result
+
+
 def run_piped_to_anew(cmd, anew_target, label: str, total: int | None = None) -> subprocess.CompletedProcess:
     """Runs cmd (list form) and pipes its stdout into `anew <anew_target>`,
     mirroring the `tool | anew outfile` pattern used throughout — dedup is

@@ -47,7 +47,7 @@ from talon_common import (
     RESET, BOLD, DIM, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN,
     log, ts, info, phase, success, warn, error, detail, die,
     which_or_die, run, count_lines, Progress, run_with_spinner, run_to_file,
-    pipe_to_anew, header_args, parse_scope_csv,
+    run_to_file_paced, pipe_to_anew, header_args, parse_scope_csv,
 )
 
 # --- Only scan assets you are authorised to test. ---
@@ -314,9 +314,9 @@ def check_interesting_ext_live(triage_dir: Path, rate: int, headers: list[str] |
     if total == 0:
         live.touch()
         return 0
-    run_to_file(
+    run_to_file_paced(
         ["httpx", "-l", str(candidates), "-silent", "-mc", "200", "-rate-limit", str(rate)] + header_args(headers),
-        live, "httpx:interestingEXT", total=total,
+        live, "httpx:interestingEXT", total=total, rate=rate,
     )
     return count_lines(live)
 
