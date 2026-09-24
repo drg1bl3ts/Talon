@@ -31,6 +31,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -477,32 +478,41 @@ def _param_signature(url: str) -> tuple:
     return (p.scheme, p.netloc, p.path, names)
 
 
-def dedupe_fuzz_candidates(candidates: Path, nuclei_dir: Path, slug: str) -> tuple[Path, int, int]:
+def dedupe_fuzz_candidates(candidates: Path, nuclei_dir: Path, slug: str, max_candidates: int | None = None) -> tuple[Path, int, int]:
     """Collapses a *_candidates.txt file down to one representative URL per
     unique (host+path, param-name-set) signature before nuclei fuzzes it.
     The original candidates file is left untouched (gf's raw match count is
     still meaningful context); only what nuclei actually scans is deduped.
+
+    If max_candidates is set and there are still more unique signatures than
+    that after dedup, randomly samples down to it — a hard ceiling on worst-
+    case runtime against a URL-rich target (a dense site can have thousands
+    of genuinely distinct injection points even after dedup; --max-candidates
+    trades completeness for a bounded, predictable scan time).
     Returns (path_to_scan, original_count, deduped_count)."""
     lines = [l.strip() for l in candidates.read_text(errors="ignore").splitlines() if l.strip()]
     seen = {}
     for line in lines:
         seen.setdefault(_param_signature(line), line)
     deduped = sorted(seen.values())
+    if max_candidates and len(deduped) > max_candidates:
+        deduped = sorted(random.sample(deduped, max_candidates))
     out = nuclei_dir / f"{slug}_candidates.deduped.txt"
     out.write_text("\n".join(deduped) + ("\n" if deduped else ""))
     return out, len(lines), len(deduped)
 
 
-def nuclei_class_scans(triage_dir: Path, nuclei_dir: Path, rate: int, headers: list[str] | None = None) -> list:
+def nuclei_class_scans(triage_dir: Path, nuclei_dir: Path, rate: int, headers: list[str] | None = None, max_candidates: int | None = None) -> list:
     outputs = []
     for cls in FUZZ_CLASSES:
         candidates = triage_dir / f"{cls['slug']}_candidates.txt"
         if count_lines(candidates) == 0:
             continue
-        scan_path, total, deduped = dedupe_fuzz_candidates(candidates, nuclei_dir, cls["slug"])
+        scan_path, total, deduped = dedupe_fuzz_candidates(candidates, nuclei_dir, cls["slug"], max_candidates)
         if deduped < total:
             info(f"{cls['slug']}: {total} candidate(s) collapsed to {deduped} unique injection point(s) "
-                 f"(same param name, different literal values — nuclei tests each signature once)")
+                 f"(same param name, different literal values — nuclei tests each signature once"
+                 + (f"; capped from a larger unique set by --max-candidates" if max_candidates and deduped == max_candidates else "") + ")")
         out = nuclei_dir / f"nuclei_{cls['slug']}.jsonl"
         cmd = [
             "nuclei", "-silent", "-l", str(scan_path), "-tags", cls["tags"],
@@ -832,6 +842,7 @@ def main():
     parser.add_argument("--no-caido-warmup", action="store_true", help="Build manual_review.txt but don't route it through Caido")
     parser.add_argument("--no-js-scan", action="store_true", help="Skip fetching JS files and scanning them for hardcoded secrets")
     parser.add_argument("--no-host-scan", action="store_true", help="Skip the all-host severity:critical CVE/misconfig sweep (the slow one — ~1,870 templates x every alive host). CORS, takeover, and per-class fuzzing passes still run.")
+    parser.add_argument("--max-candidates", type=int, default=None, help="Cap each fuzz class's deduped candidate list to this many (random sample) before nuclei scans it — bounds worst-case runtime against a URL-rich target instead of scanning every unique injection point found. Default: unlimited.")
     parser.add_argument("--discord", action="store_true", help="Send a clean summary to Discord via `notify` when done")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     parser.add_argument("--quiet", action="store_true", help="Suppress the banner")
@@ -928,7 +939,7 @@ def main():
         host_out = nuclei_host_scan(alive_path, nuclei_dir, args.rate, args.headers)
     cors_out = nuclei_cors_scan(alive_path, nuclei_dir, args.rate, args.headers)
     cors_findings = parse_nuclei_jsonl([cors_out] if cors_out else [])
-    class_outs = nuclei_class_scans(triage_dir, nuclei_dir, args.rate, args.headers)
+    class_outs = nuclei_class_scans(triage_dir, nuclei_dir, args.rate, args.headers, args.max_candidates)
     all_paths = ([host_out] if host_out else []) + [p for _, p in class_outs]
     findings = parse_nuclei_jsonl(all_paths) + cors_findings
     success(f"nuclei complete — {len(findings)} finding(s)")
