@@ -80,7 +80,7 @@ The installer sets up everything: Go, the recon toolchain (subfinder/httpx/dnsx/
 | `--skip-recon` | Reuse an existing results dir instead of running Talon's own recon pipeline again |
 | `--indir` | Point at a custom output dir (default: `results/<target>` or `$OUTDIR`) |
 | `--param-jobs` | Parallel paramspider workers during recon (default: 5) |
-| `--scope-file` | One in-scope domain per line (apex or `*.sub.domain`). Filters `all_urls.txt` and `fresh_alive_domains` before anything downstream touches them |
+| `--scope-file` | One in-scope domain per line (apex or `*.sub.domain`), or a HackerOne scope CSV export (`.csv` extension). Filters `all_urls.txt` and `fresh_alive_domains` before anything downstream touches them |
 | `--rate` | nuclei/httpx `-rate-limit` (default: 50 — this is live production infrastructure, not a lab box) |
 | `-H, --header` | Custom header added to every live HTTP request Talon makes — recon (httpx/katana), triage (httpx/nuclei), and the Caido warm-up (curl). Repeatable, e.g. `-H 'X-HackerOne-Researcher: yourname'` |
 | `--caido-proxy` | Caido proxy address (default: `http://127.0.0.1:8080`) |
@@ -135,6 +135,12 @@ api.example.com
 *.staging.example.com
 EOF
 talon -t example.com --scope-file scope.txt
+```
+
+Or point it straight at a HackerOne scope export (Program page → Scope → Download CSV) — mobile app store entries are skipped automatically since Talon only tests HTTP assets:
+
+```bash
+talon -t example.com --scope-file scope_export.csv
 ```
 
 ### Identify yourself to the target (e.g. HackerOne)

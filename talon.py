@@ -28,6 +28,7 @@ Author: Dan
 """
 
 import argparse
+import csv
 import json
 import logging
 import os
@@ -215,9 +216,52 @@ def require_file(path: Path, hint: str):
         die(f"Expected recon output missing: {path}\n           {hint}")
 
 
+def _scope_hostname(identifier: str) -> str:
+    identifier = identifier.strip().lower()
+    if "://" in identifier:
+        identifier = urlparse(identifier).hostname or identifier
+    return identifier.lstrip("*.").lstrip(".")
+
+
+# Asset types a domain/URL-based scope filter can actually apply to.
+# H1 scope exports also list mobile app store IDs, source-code repos, etc. —
+# those can't be matched against a hostname, so they're dropped rather than
+# silently mismatching every URL Talon collects (or worse, matching none and
+# emptying scope entirely).
+SCOPE_CSV_WEB_ASSET_TYPES = {"URL", "WILDCARD"}
+
+
+def load_scope_csv(scope_file: Path) -> list[str]:
+    """Parses a HackerOne scope export (Program page -> Scope -> Download CSV):
+    identifier,asset_type,instruction,eligible_for_bounty,eligible_for_submission,...
+    Keeps only URL/WILDCARD rows marked eligible_for_submission (missing/blank
+    counts as eligible — some exports omit the column entirely)."""
+    with scope_file.open(newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or "identifier" not in reader.fieldnames:
+            die(f"--scope-file {scope_file} looks like a CSV but has no 'identifier' column — expected a HackerOne scope export")
+        domains = []
+        skipped_non_web = 0
+        for row in reader:
+            identifier = (row.get("identifier") or "").strip()
+            asset_type = (row.get("asset_type") or "").strip().upper()
+            eligible = (row.get("eligible_for_submission") or "true").strip().lower()
+            if not identifier or eligible == "false":
+                continue
+            if asset_type not in SCOPE_CSV_WEB_ASSET_TYPES:
+                skipped_non_web += 1
+                continue
+            domains.append(_scope_hostname(identifier))
+    if skipped_non_web:
+        info(f"{skipped_non_web} non-web scope row(s) skipped (mobile apps, etc. — Talon only tests HTTP assets)")
+    return sorted(set(domains))
+
+
 def load_scope(scope_file: Path) -> list[str]:
     if not scope_file.exists():
         die(f"--scope-file not found: {scope_file}")
+    if scope_file.suffix.lower() == ".csv":
+        return load_scope_csv(scope_file)
     domains = []
     for line in scope_file.read_text().splitlines():
         line = line.strip().lower()
@@ -770,7 +814,7 @@ def main():
     parser.add_argument("--skip-recon", action="store_true", help="Skip Talon's own recon pipeline; use an existing results dir")
     parser.add_argument("--indir", default=None, help="Custom output dir (default: results/<target> or $OUTDIR)")
     parser.add_argument("--param-jobs", type=int, default=5, help="Parallel paramspider workers during recon (default: 5)")
-    parser.add_argument("--scope-file", default=None, help="One in-scope domain per line (apex or subdomain). Filters every URL/host list before any of it gets fuzzed, JS-scanned, or routed through Caido.")
+    parser.add_argument("--scope-file", default=None, help="One in-scope domain per line (apex or subdomain), or a HackerOne scope CSV export (detected by .csv extension). Filters every URL/host list before any of it gets fuzzed, JS-scanned, or routed through Caido.")
     parser.add_argument("--rate", type=int, default=50, help="nuclei -rate-limit (default: 50)")
     parser.add_argument(
         "-H", "--header", dest="headers", action="append", default=[],
