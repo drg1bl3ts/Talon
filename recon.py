@@ -40,7 +40,7 @@ from urllib.parse import urlparse
 from talon_common import (
     detail, error, info, phase, success, warn, ts, GREEN, RESET,
     count_lines, run_to_file, run_piped_to_anew, run_with_deadline_progress,
-    run_with_spinner, which_or_die, Progress, header_args,
+    run_with_spinner, which_or_die, Progress, header_args, parse_scope_csv,
 )
 
 RECON_TOOLS = [
@@ -69,8 +69,9 @@ def is_valid_domain(d: str) -> bool:
 
 def load_targets(target: str | None, list_file: str | None) -> tuple[list[str], str]:
     """Handles -t/-l target selection: a single validated domain, or a
-    deduped, validated set of domains read one-per-line from a file
-    (blank lines and #-comments skipped). Returns (targets, label)."""
+    deduped, validated set of domains from a file — one-per-line, or a raw
+    HackerOne scope CSV export (detected by .csv extension, parsed the same
+    way --scope-file parses one). Returns (targets, label)."""
     if target and list_file:
         raise ValueError("Use either target or list_file, not both.")
     if not target and not list_file:
@@ -88,12 +89,18 @@ def load_targets(target: str | None, list_file: str | None) -> tuple[list[str], 
     if path.stat().st_size == 0:
         raise ValueError(f"List file is empty: {list_file}")
 
+    if path.suffix.lower() == ".csv":
+        candidates = parse_scope_csv(path)
+    else:
+        candidates = []
+        for raw in path.read_text().splitlines():
+            line = raw.split("#", 1)[0].strip().lower()
+            if line:
+                candidates.append(line)
+
     targets = set()
     skipped = 0
-    for raw in path.read_text().splitlines():
-        line = raw.split("#", 1)[0].strip().lower()
-        if not line:
-            continue
+    for line in candidates:
         if is_valid_domain(line):
             targets.add(line)
         else:
@@ -102,7 +109,7 @@ def load_targets(target: str | None, list_file: str | None) -> tuple[list[str], 
     if not targets:
         raise ValueError(f"No valid domains found in: {list_file}")
     if skipped:
-        warn(f"{skipped} invalid line(s) skipped from {list_file}")
+        warn(f"{skipped} invalid/non-domain entr{'y' if skipped == 1 else 'ies'} skipped from {list_file}")
 
     targets = sorted(targets)
     return targets, f"{len(targets)} domains ({list_file})"

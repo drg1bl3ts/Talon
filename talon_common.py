@@ -7,6 +7,7 @@ Split out of talon.py so recon.py (the recon engine) and talon.py
 rolling its own.
 """
 
+import csv
 import json
 import logging
 import subprocess
@@ -15,6 +16,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -55,6 +57,51 @@ def header_args(headers: list[str] | None) -> list[str]:
     for h in headers:
         args += ["-H", h]
     return args
+
+
+def _scope_csv_hostname(identifier: str) -> str:
+    identifier = identifier.strip().lower()
+    if "://" in identifier:
+        identifier = urlparse(identifier).hostname or identifier
+    return identifier.lstrip("*.").lstrip(".")
+
+
+# Asset types a domain/URL-based scope filter can actually apply to. H1
+# scope exports also list mobile app store IDs, source-code repos, etc. —
+# those can't be matched against a hostname, so they're dropped rather than
+# silently mismatching every URL Talon collects (or worse, matching none
+# and emptying scope entirely).
+SCOPE_CSV_WEB_ASSET_TYPES = {"URL", "WILDCARD"}
+
+
+def parse_scope_csv(csv_path: Path) -> list[str]:
+    """Parses a HackerOne scope export (Program page -> Scope -> Download
+    CSV): identifier,asset_type,instruction,eligible_for_bounty,
+    eligible_for_submission,... Keeps only URL/WILDCARD rows marked
+    eligible_for_submission (missing/blank counts as eligible — some
+    exports omit the column entirely). Shared by --scope-file (talon.py)
+    and -l/--list (recon.py) so both parse a raw H1 export identically —
+    pass the same CSV to both flags instead of hand-building a domain
+    list."""
+    with csv_path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or "identifier" not in reader.fieldnames:
+            die(f"{csv_path} looks like a CSV but has no 'identifier' column — expected a HackerOne scope export")
+        domains = []
+        skipped_non_web = 0
+        for row in reader:
+            identifier = (row.get("identifier") or "").strip()
+            asset_type = (row.get("asset_type") or "").strip().upper()
+            eligible = (row.get("eligible_for_submission") or "true").strip().lower()
+            if not identifier or eligible == "false":
+                continue
+            if asset_type not in SCOPE_CSV_WEB_ASSET_TYPES:
+                skipped_non_web += 1
+                continue
+            domains.append(_scope_csv_hostname(identifier))
+    if skipped_non_web:
+        info(f"{skipped_non_web} non-web scope row(s) skipped (mobile apps, etc. — Talon only tests HTTP assets)")
+    return sorted(set(domains))
 
 
 def which_or_die(tools):

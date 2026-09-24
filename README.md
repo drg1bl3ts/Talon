@@ -76,7 +76,7 @@ The installer sets up everything: Go, the recon toolchain (subfinder/httpx/dnsx/
 | Flag | Description |
 | --- | --- |
 | `-t, --target` | Single target domain |
-| `-l, --list` | File with one domain per line (multi-target) |
+| `-l, --list` | File with one domain per line (multi-target), or a HackerOne scope CSV export (`.csv` extension) |
 | `--skip-recon` | Reuse an existing results dir instead of running Talon's own recon pipeline again |
 | `--indir` | Point at a custom output dir (default: `results/<target>` for `-t`, `results/<list-file's-directory-name>` for `-l`, or `$OUTDIR`) |
 | `--param-jobs` | Parallel paramspider workers during recon (default: 5) |
@@ -141,6 +141,14 @@ Or point it straight at a HackerOne scope export (Program page → Scope → Dow
 
 ```bash
 talon -t example.com --scope-file scope_export.csv
+```
+
+### Run against a raw HackerOne scope export, no hand-built domain list
+
+`-l` accepts a scope CSV directly (same parsing `--scope-file` uses), so the export doubles as both the recon target list and the downstream scope filter — no risk of the two drifting out of sync:
+
+```bash
+talon -l scope_export.csv --scope-file scope_export.csv
 ```
 
 ### Identify yourself to the target (e.g. HackerOne)
