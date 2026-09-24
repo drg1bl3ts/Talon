@@ -581,6 +581,11 @@ def build_manual_review(triage_dir: Path) -> tuple[Path, int]:
 
 
 def caido_warmup(manual_review: Path, proxy: str, timeout: int, delay: float, headers: list[str] | None = None):
+    # -L: a lot of manual_review.txt entries are recorded as http:// (from
+    # historical/archived URLs) and most sites 301 those straight to https.
+    # Without following, Caido's Sitemap ends up full of redirect stubs
+    # instead of the actual page a human needs to review — each entry still
+    # counts as one warmed-up URL either way, so this doesn't change pacing.
     urls = [l for l in manual_review.read_text(errors="ignore").splitlines() if l.strip()]
     if not urls:
         return
@@ -589,7 +594,7 @@ def caido_warmup(manual_review: Path, proxy: str, timeout: int, delay: float, he
     for i, url in enumerate(urls, 1):
         progress.update(f"{i}/{len(urls)} URLs", percent=100 * (i - 1) / len(urls))
         run(
-            ["curl", "-sk", "--max-time", str(timeout), "-x", proxy] + header_args(headers) + [url, "-o", "/dev/null"],
+            ["curl", "-sk", "-L", "--max-time", str(timeout), "-x", proxy] + header_args(headers) + [url, "-o", "/dev/null"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
