@@ -463,15 +463,49 @@ def nuclei_takeover_scan(alive: Path, nuclei_dir: Path, rate: int, headers: list
     return out if out.exists() else None
 
 
+def _param_signature(url: str) -> tuple:
+    """Host+path plus the sorted set of query-parameter NAMES (values
+    dropped) — the actual injection point nuclei's fuzzing templates test.
+    Two candidate URLs differing only in parameter values (a different
+    product id, a different rtnUrl destination, etc.) share a signature:
+    nuclei substitutes its own payload into the value regardless of what
+    was originally there, so testing the same name once already covers
+    what testing it thousands of times with different literal values
+    would."""
+    p = urlparse(url)
+    names = tuple(sorted({kv.split("=", 1)[0] for kv in p.query.split("&") if kv}))
+    return (p.scheme, p.netloc, p.path, names)
+
+
+def dedupe_fuzz_candidates(candidates: Path, nuclei_dir: Path, slug: str) -> tuple[Path, int, int]:
+    """Collapses a *_candidates.txt file down to one representative URL per
+    unique (host+path, param-name-set) signature before nuclei fuzzes it.
+    The original candidates file is left untouched (gf's raw match count is
+    still meaningful context); only what nuclei actually scans is deduped.
+    Returns (path_to_scan, original_count, deduped_count)."""
+    lines = [l.strip() for l in candidates.read_text().splitlines() if l.strip()]
+    seen = {}
+    for line in lines:
+        seen.setdefault(_param_signature(line), line)
+    deduped = sorted(seen.values())
+    out = nuclei_dir / f"{slug}_candidates.deduped.txt"
+    out.write_text("\n".join(deduped) + ("\n" if deduped else ""))
+    return out, len(lines), len(deduped)
+
+
 def nuclei_class_scans(triage_dir: Path, nuclei_dir: Path, rate: int, headers: list[str] | None = None) -> list:
     outputs = []
     for cls in FUZZ_CLASSES:
         candidates = triage_dir / f"{cls['slug']}_candidates.txt"
         if count_lines(candidates) == 0:
             continue
+        scan_path, total, deduped = dedupe_fuzz_candidates(candidates, nuclei_dir, cls["slug"])
+        if deduped < total:
+            info(f"{cls['slug']}: {total} candidate(s) collapsed to {deduped} unique injection point(s) "
+                 f"(same param name, different literal values — nuclei tests each signature once)")
         out = nuclei_dir / f"nuclei_{cls['slug']}.jsonl"
         cmd = [
-            "nuclei", "-silent", "-l", str(candidates), "-tags", cls["tags"],
+            "nuclei", "-silent", "-l", str(scan_path), "-tags", cls["tags"],
             "-etags", "dos", "-rate-limit", str(rate), "-jsonl", "-o", str(out),
         ] + header_args(headers)
         if cls["templates"]:
