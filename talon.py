@@ -14,7 +14,7 @@ host with nuclei (including a dedicated CORS pass and a
 subdomain-takeover pass), fetches JS files to check for hardcoded
 secrets, diffs this run against the last one against the same target,
 and writes out a recommendations report scoped for manual follow-up in
-Caido.
+Caido or Burp Suite (--proxy).
 
 Usage:
     talon.py -t example.com
@@ -22,7 +22,9 @@ Usage:
     talon.py -t example.com --skip-recon
     talon.py -t example.com --skip-recon --indir /path/to/results/example.com
     talon.py -t example.com --scope-file scope.txt
-    talon.py -t example.com --no-caido-warmup --discord
+    talon.py -t example.com --proxy caido --discord
+    talon.py -t example.com --proxy burp
+    talon.py -t example.com --ssrf --lfi   # triage only these vuln classes
 
 Author: Dan
 """
@@ -113,8 +115,6 @@ DANGEROUS_EXT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-GF_ALL = FUZZ_CLASSES + MANUAL_CLASSES + [EXT_CLASS]
-
 # High-confidence secret formats to hunt for inside JS file bodies. Kept
 # narrow and well-known (vs. gf's generic jsvar, which just matches any
 # `var x = "..."` and is mostly noise) — these are the same shapes
@@ -133,22 +133,48 @@ SECRET_PATTERNS = [
 ]
 SECRET_PATTERN_NAMES = {pattern: name for name, pattern in SECRET_PATTERNS}
 
+# The warm-up itself is just `curl -x <proxy>` — mechanically identical for
+# Caido and Burp Suite, and both default to listening on this same address,
+# so there's no separate --proxy-address flag to keep in sync. The only
+# thing --proxy actually changes is what to call things in progress
+# messages and RECOMMENDATIONS.md, so it just swaps this terms dict in.
+PROXY_ADDRESS = "http://127.0.0.1:8080"
+
+PROXY_TOOLS = {
+    "caido": {
+        "name": "Caido",
+        "history": "Sitemap",
+        "replay": "Caido Replay",
+        "fuzzer": "Caido's built-in param fuzzer",
+        "filter_note": "Use HTTPQL to slice traffic by status code / response length outliers before hand-testing each one.",
+    },
+    "burp": {
+        "name": "Burp Suite",
+        "history": "Proxy > HTTP history",
+        "replay": "Burp Repeater",
+        "fuzzer": "Burp Intruder",
+        "filter_note": "Use the Proxy filter bar to slice traffic by status code / response length outliers before hand-testing each one.",
+    },
+}
+
+# {name}/{replay}/{fuzzer} are filled in from PROXY_TOOLS at report-write
+# time via str.format(**terms) — see write_recommendations_md.
 RECOMMENDATIONS = {
-    "xss": "Nuclei's fuzzing templates already threw standard payloads at these. Anything still open: Caido Replay with context-aware encoding (attribute breakout, JS-string breakout) nuclei's generic payloads don't try.",
-    "sqli": "Nuclei's fuzzing templates cover common injection points. Follow up in Caido Replay with time-based/boolean-based blind payloads and DB-specific syntax nuclei's generic set may miss.",
-    "ssrf": "Confirm any nuclei hits with an out-of-band listener (interactsh). In Caido Replay, try internal-range targets and cloud metadata URLs (169.254.169.254) by hand.",
-    "lfi": "Nuclei's fuzzing templates cover common traversal depths/wrappers. In Caido Replay, try OS-specific null-byte/encoding tricks and PHP wrappers (php://filter) nuclei's set may miss.",
-    "rce": "High-impact — verify any nuclei hit manually before trusting it. In Caido Replay, confirm with an out-of-band callback rather than relying on response text alone.",
-    "ssti": "Nuclei's fuzzing templates cover common engines. In Caido Replay, fingerprint the template engine first (polyglot payload), then hand-craft an engine-specific chain.",
-    "img_traversal": "LFI variant via image-loading endpoints. In Caido Replay, try relative-path traversal through the image parameter specifically, not just the generic LFI candidates.",
-    "redirect": "Low-signal on its own. In Caido Replay, check whether the redirect target is validated at all (open redirect -> phishing pivot, or OAuth `redirect_uri` abuse).",
-    "idor": "No generic signature exists for broken access control. Caido Replay: swap the session/auth token between two authenticated identities on the same object id, diff the responses.",
-    "interestingparams": "Not one specific vuln class — a shortlist worth a closer look. Send to Caido Replay and fuzz each param by hand (or Caido's built-in param fuzzer).",
-    "debug_logic": "Manual — toggle the flag/value (debug=1, admin=true, test=1, verbose=true) via Caido Replay and watch for behavior or response changes.",
+    "xss": "Nuclei's fuzzing templates already threw standard payloads at these. Anything still open: {replay} with context-aware encoding (attribute breakout, JS-string breakout) nuclei's generic payloads don't try.",
+    "sqli": "Nuclei's fuzzing templates cover common injection points. Follow up in {replay} with time-based/boolean-based blind payloads and DB-specific syntax nuclei's generic set may miss.",
+    "ssrf": "Confirm any nuclei hits with an out-of-band listener (interactsh). In {replay}, try internal-range targets and cloud metadata URLs (169.254.169.254) by hand.",
+    "lfi": "Nuclei's fuzzing templates cover common traversal depths/wrappers. In {replay}, try OS-specific null-byte/encoding tricks and PHP wrappers (php://filter) nuclei's set may miss.",
+    "rce": "High-impact — verify any nuclei hit manually before trusting it. In {replay}, confirm with an out-of-band callback rather than relying on response text alone.",
+    "ssti": "Nuclei's fuzzing templates cover common engines. In {replay}, fingerprint the template engine first (polyglot payload), then hand-craft an engine-specific chain.",
+    "img_traversal": "LFI variant via image-loading endpoints. In {replay}, try relative-path traversal through the image parameter specifically, not just the generic LFI candidates.",
+    "redirect": "Low-signal on its own. In {replay}, check whether the redirect target is validated at all (open redirect -> phishing pivot, or OAuth `redirect_uri` abuse).",
+    "idor": "No generic signature exists for broken access control. {replay}: swap the session/auth token between two authenticated identities on the same object id, diff the responses.",
+    "interestingparams": "Not one specific vuln class — a shortlist worth a closer look. Send to {replay} and fuzz each param by hand (or {fuzzer}).",
+    "debug_logic": "Manual — toggle the flag/value (debug=1, admin=true, test=1, verbose=true) via {replay} and watch for behavior or response changes.",
     "interestingEXT_dangerous": "CONFIRMED live AND matched a high-risk extension (git/env/sql/backup/config/key/etc.). Pull the file directly and inspect for leaked source, credentials, or config. Everything else in interestingEXT_live.txt is presumed public (PDFs/docs/assets) and wasn't queued.",
     "js_secrets": "Regex-matched a known secret format inside live JS source. Verify by hand first — check surrounding context for dummy/example/test keys before trusting it. If it's real: confirm scope (is it actually active?) and report immediately — a live credential in client-side JS is often a direct account or API compromise.",
     "takeover": "Nuclei matched a dangling-CNAME fingerprint (the platform's 'no such app'/'NoSuchBucket'-style error page). Verify manually before claiming: confirm the CNAME still points at the deprovisioned resource, then actually claim/register the resource yourself if the platform allows it — a fingerprint match without a successful claim isn't a confirmed takeover.",
-    "cors": "Nuclei flagged a reflected/wildcard Access-Control-Allow-Origin. Check in Caido whether it's paired with Access-Control-Allow-Credentials: true (that combination is what actually enables cross-origin credentialed reads) — a permissive CORS header alone on a public endpoint often isn't exploitable.",
+    "cors": "Nuclei flagged a reflected/wildcard Access-Control-Allow-Origin. Check in {name} whether it's paired with Access-Control-Allow-Credentials: true (that combination is what actually enables cross-origin credentialed reads) — a permissive CORS header alone on a public endpoint often isn't exploitable.",
 }
 
 
@@ -198,7 +224,7 @@ def run_nuclei_with_progress(cmd: list, label: str) -> int:
 def banner():
     print(f"{CYAN}{BOLD}")
     print("╭─ TALON ─ Parameter & Vulnerability Triage ─╮")
-    print("│   Recon → gf → nuclei → Caido queue (standalone)  │")
+    print("│   Recon → gf → nuclei → proxy queue (standalone)  │")
     print("╰" + "─" * 51 + "╯")
     print(RESET)
 
@@ -300,11 +326,11 @@ def build_all_urls(outdir: Path, triage_dir: Path) -> tuple[Path, int]:
     return out, len(lines)
 
 
-def gf_triage(all_urls: Path, triage_dir: Path) -> dict:
+def gf_triage(all_urls: Path, triage_dir: Path, classes: list) -> dict:
     counts = {}
     progress = Progress("gf:triage")
-    for i, cls in enumerate(GF_ALL, 1):
-        progress.update(f"{cls['slug']} ({i}/{len(GF_ALL)})", percent=100 * (i - 1) / len(GF_ALL))
+    for i, cls in enumerate(classes, 1):
+        progress.update(f"{cls['slug']} ({i}/{len(classes)})", percent=100 * (i - 1) / len(classes))
         out = triage_dir / f"{cls['slug']}_candidates.txt"
         # pipe_to_anew (not a shell string) so a missing/misnamed gf
         # pattern's real exit code is what gets checked — a shell
@@ -514,9 +540,9 @@ def dedupe_fuzz_candidates(candidates: Path, nuclei_dir: Path, slug: str, max_ca
     return out, len(lines), len(deduped)
 
 
-def nuclei_class_scans(triage_dir: Path, nuclei_dir: Path, rate: int, headers: list[str] | None = None, max_candidates: int | None = None) -> list:
+def nuclei_class_scans(triage_dir: Path, nuclei_dir: Path, rate: int, classes: list, headers: list[str] | None = None, max_candidates: int | None = None) -> list:
     outputs = []
-    for cls in FUZZ_CLASSES:
+    for cls in classes:
         candidates = triage_dir / f"{cls['slug']}_candidates.txt"
         if count_lines(candidates) == 0:
             continue
@@ -566,8 +592,8 @@ def parse_nuclei_jsonl(paths) -> list:
     return findings
 
 
-def build_manual_review(triage_dir: Path) -> tuple[Path, int]:
-    files = [f"{c['slug']}_candidates.txt" for c in MANUAL_CLASSES] + [
+def build_manual_review(triage_dir: Path, classes: list) -> tuple[Path, int]:
+    files = [f"{c['slug']}_candidates.txt" for c in classes] + [
         "interestingEXT_dangerous.txt", "js_secrets_urls.txt", "takeover_urls.txt",
     ]
     lines = set()
@@ -580,17 +606,19 @@ def build_manual_review(triage_dir: Path) -> tuple[Path, int]:
     return out, len(lines)
 
 
-def caido_warmup(manual_review: Path, proxy: str, timeout: int, delay: float, headers: list[str] | None = None):
+def proxy_warmup(manual_review: Path, proxy: str, timeout: int, delay: float, terms: dict, headers: list[str] | None = None):
     # -L: a lot of manual_review.txt entries are recorded as http:// (from
     # historical/archived URLs) and most sites 301 those straight to https.
-    # Without following, Caido's Sitemap ends up full of redirect stubs
-    # instead of the actual page a human needs to review — each entry still
-    # counts as one warmed-up URL either way, so this doesn't change pacing.
+    # Without following, the proxy's history view ends up full of redirect
+    # stubs instead of the actual page a human needs to review — each entry
+    # still counts as one warmed-up URL either way, so this doesn't change
+    # pacing. Purely a curl -x call — works unmodified against any proxy
+    # (Caido, Burp Suite, mitmproxy, ...); `terms` only controls wording.
     urls = [l for l in manual_review.read_text(errors="ignore").splitlines() if l.strip()]
     if not urls:
         return
-    phase(f"CAIDO WARM-UP — routing {len(urls)} URLs through {proxy}")
-    progress = Progress("caido:warmup")
+    phase(f"{terms['name'].upper()} WARM-UP — routing {len(urls)} URLs through {proxy}")
+    progress = Progress("proxy:warmup")
     for i, url in enumerate(urls, 1):
         progress.update(f"{i}/{len(urls)} URLs", percent=100 * (i - 1) / len(urls))
         run(
@@ -599,7 +627,7 @@ def caido_warmup(manual_review: Path, proxy: str, timeout: int, delay: float, he
             stderr=subprocess.DEVNULL,
         )
         time.sleep(delay)
-    progress.stop(f"{GREEN}[{ts()}] ✓{RESET} {len(urls)} URLs sent through Caido — check Sitemap")
+    progress.stop(f"{GREEN}[{ts()}] ✓{RESET} {len(urls)} URLs sent through {terms['name']} — check {terms['history']}")
 
 
 STATE_FILE = "talon_state.json"
@@ -640,12 +668,16 @@ def write_recommendations_md(
     findings: list, manual_count: int, warmed_up: bool,
     has_prev_run: bool, new_findings: list, new_secrets: list, new_dangerous: list, new_manual: list,
     takeover_findings: list, cors_findings: list,
+    terms: dict, classes: list, skipped_classes: list[str],
 ) -> Path:
     sev = severity_breakdown(findings)
     lines = []
     lines.append(f"# Talon Triage Report — {target}")
     lines.append(f"\nGenerated: {datetime.now(timezone.utc).isoformat()}")
     lines.append("\n> Only scan assets you are authorised to test.\n")
+
+    if skipped_classes:
+        lines.append(f"> Vulnerability-class filter active — skipped this run: {', '.join(skipped_classes)}\n")
 
     if has_prev_run:
         total_new = len(new_findings) + len(new_secrets) + len(new_dangerous) + len(new_manual)
@@ -675,7 +707,7 @@ def write_recommendations_md(
     lines.append(f"\n{url_count} unique URLs fed into GF triage.\n")
     lines.append("| Class | Candidates |")
     lines.append("|---|---|")
-    for cls in GF_ALL:
+    for cls in classes + [EXT_CLASS]:
         n = gf_counts.get(cls["slug"], 0)
         label = "interestingEXT (high-risk / live / checked)" if cls["slug"] == "interestingEXT" else cls["slug"]
         if cls["slug"] == "interestingEXT":
@@ -707,33 +739,33 @@ def write_recommendations_md(
 
     lines.append(f"\n## Manual Testing Queue — {manual_count} URLs → `triage/manual_review.txt`")
     if warmed_up:
-        lines.append("\nAlready routed through Caido's proxy — check Sitemap for HTTP History.")
+        lines.append(f"\nAlready routed through {terms['name']}'s proxy — check {terms['history']}.")
     lines.append(
-        "\nIn Caido: Sitemap → filter by host → Replay tab for param tampering. "
-        "Use HTTPQL to slice traffic by status code / response length outliers before hand-testing each one.\n"
+        f"\nIn {terms['name']}: {terms['history']} → filter by host → {terms['replay']} for param tampering. "
+        f"{terms['filter_note']}\n"
     )
 
     lines.append("## Recommendations by Class")
-    for cls in FUZZ_CLASSES + MANUAL_CLASSES:
+    for cls in classes:
         n = gf_counts.get(cls["slug"], 0)
         if n == 0:
             continue
         lines.append(f"\n### {cls['slug']} ({n} candidate{'s' if n != 1 else ''})")
-        lines.append(RECOMMENDATIONS.get(cls["slug"], ""))
+        lines.append(RECOMMENDATIONS.get(cls["slug"], "").format(**terms))
     if dangerous_count:
         lines.append(f"\n### interestingEXT_dangerous ({dangerous_count} of {ext_live_count} live hits)")
-        lines.append(RECOMMENDATIONS["interestingEXT_dangerous"])
+        lines.append(RECOMMENDATIONS["interestingEXT_dangerous"].format(**terms))
     if secret_findings:
         lines.append(f"\n### js_secrets ({len(secret_findings)} potential match{'es' if len(secret_findings) != 1 else ''})")
-        lines.append(RECOMMENDATIONS["js_secrets"])
+        lines.append(RECOMMENDATIONS["js_secrets"].format(**terms))
     if takeover_findings:
         lines.append(f"\n### takeover ({len(takeover_findings)} candidate{'s' if len(takeover_findings) != 1 else ''})")
-        lines.append(RECOMMENDATIONS["takeover"])
+        lines.append(RECOMMENDATIONS["takeover"].format(**terms))
         for f in takeover_findings:
             lines.append(f"- {f['template_id']} — {f['matched_at']}")
     if cors_findings:
         lines.append(f"\n### cors ({len(cors_findings)} finding{'s' if len(cors_findings) != 1 else ''})")
-        lines.append(RECOMMENDATIONS["cors"])
+        lines.append(RECOMMENDATIONS["cors"].format(**terms))
         for f in cors_findings:
             lines.append(f"- {f['matched_at']}")
 
@@ -747,6 +779,7 @@ def write_json_summary(
     ext_live_count: int, dangerous_count: int, js_count: int, secret_findings: list,
     findings: list, manual_count: int,
     has_prev_run: bool, new_findings: list, new_secrets: list, new_dangerous: list, new_manual: list,
+    skipped_classes: list[str],
 ) -> Path:
     summary = {
         "tool": "talon",
@@ -755,6 +788,7 @@ def write_json_summary(
         "target": target,
         "phase": "vulnerability-discovery",
         "url_count": url_count,
+        "vuln_class_filter_skipped": skipped_classes,
         "triage_counts": gf_counts,
         "interestingEXT_live_count": ext_live_count,
         "interestingEXT_dangerous_count": dangerous_count,
@@ -784,7 +818,7 @@ def discord_notify(target: str, url_count: int, secret_count: int, findings: lis
     secret_str = f", {secret_count} potential JS secret(s)" if secret_count else ""
     msg = (
         f"Talon triage done for {target} — {url_count} URLs triaged{secret_str}, "
-        f"nuclei: {sev_str}, {manual_count} URLs queued for manual/Caido review."
+        f"nuclei: {sev_str}, {manual_count} URLs queued for manual/proxy review."
     )
     # notify's -silent only suppresses its banner/log noise — by design it
     # still echoes the message it's sending to stdout, so it doesn't spill
@@ -835,7 +869,9 @@ def main():
             "  talon.py -t example.com --skip-recon\n"
             "  talon.py -t example.com --scope-file scope.txt\n"
             "  talon.py -t example.com --no-host-scan   # skip the slow all-host CVE sweep\n"
-            "  talon.py -t example.com --no-caido-warmup --discord\n"
+            "  talon.py -t example.com --proxy caido   # warm up Caido's Sitemap with the manual queue\n"
+            "  talon.py -t example.com --proxy burp   # same, worded for Burp Suite instead\n"
+            "  talon.py -t example.com --ssrf --lfi   # only triage these vuln classes\n"
         ),
     )
     target_group = parser.add_mutually_exclusive_group(required=True)
@@ -844,22 +880,39 @@ def main():
     parser.add_argument("--skip-recon", action="store_true", help="Skip Talon's own recon pipeline; use an existing results dir")
     parser.add_argument("--indir", default=None, help="Custom output dir (default: results/<target> or $OUTDIR)")
     parser.add_argument("--param-jobs", type=int, default=5, help="Parallel paramspider workers during recon (default: 5)")
-    parser.add_argument("--scope-file", default=None, help="One in-scope domain per line (apex or subdomain), or a HackerOne scope CSV export (detected by .csv extension). Filters every URL/host list before any of it gets fuzzed, JS-scanned, or routed through Caido.")
+    parser.add_argument("--scope-file", default=None, help="One in-scope domain per line (apex or subdomain), or a HackerOne scope CSV export (detected by .csv extension). Filters every URL/host list before any of it gets fuzzed, JS-scanned, or routed through the proxy warm-up.")
     parser.add_argument("--rate", type=int, default=50, help="nuclei -rate-limit (default: 50)")
     parser.add_argument(
         "-H", "--header", dest="headers", action="append", default=[],
         metavar="'Name: Value'",
         help="Custom header added to every live HTTP request Talon makes — recon (httpx/katana), "
-             "triage (httpx/nuclei), and the Caido warm-up (curl). Repeatable. "
+             "triage (httpx/nuclei), and the proxy warm-up (curl). Repeatable. "
              "e.g. -H 'X-HackerOne-Researcher: yourname'",
     )
-    parser.add_argument("--caido-proxy", default="http://127.0.0.1:8080", help="Caido proxy address (default: http://127.0.0.1:8080)")
-    parser.add_argument("--caido-timeout", type=int, default=10, help="Per-request curl --max-time for the Caido warm-up (default: 10)")
-    parser.add_argument("--caido-delay", type=float, default=None, help="Delay between Caido warm-up requests, seconds (default: derived from --rate, so the warm-up never exceeds the same requests/sec ceiling as everything else)")
-    parser.add_argument("--no-caido-warmup", action="store_true", help="Build manual_review.txt but don't route it through Caido")
+    parser.add_argument(
+        "--proxy", choices=sorted(PROXY_TOOLS), default=None,
+        help="Route the manual-review queue through this proxy tool's warm-up (curl -x http://127.0.0.1:8080 — "
+             "Caido and Burp Suite both default to that same address, so no separate address flag exists). "
+             "Also picks the wording used in progress messages and RECOMMENDATIONS.md (Caido Replay/Sitemap vs "
+             "Burp Repeater/HTTP history). Omit to skip the warm-up entirely (default).",
+    )
+    parser.add_argument("--proxy-timeout", type=int, default=10, help="Per-request curl --max-time for the proxy warm-up (default: 10)")
+    parser.add_argument("--proxy-delay", type=float, default=None, help="Delay between proxy warm-up requests, seconds (default: derived from --rate, so the warm-up never exceeds the same requests/sec ceiling as everything else)")
     parser.add_argument("--no-js-scan", action="store_true", help="Skip fetching JS files and scanning them for hardcoded secrets")
     parser.add_argument("--no-host-scan", action="store_true", help="Skip the all-host severity:critical CVE/misconfig sweep (the slow one — ~1,870 templates x every alive host). CORS, takeover, and per-class fuzzing passes still run.")
     parser.add_argument("--max-candidates", type=int, default=None, help="Cap each fuzz class's deduped candidate list to this many (random sample) before nuclei scans it — bounds worst-case runtime against a URL-rich target instead of scanning every unique injection point found. Default: unlimited.")
+
+    vuln_group = parser.add_argument_group(
+        "vulnerability-class filter",
+        "Opt-in: with none of these set, every class below is triaged (today's default behavior). "
+        "Set one or more to restrict gf triage + nuclei fuzzing + the manual queue to just those classes — "
+        "e.g. --ssrf --lfi triages only SSRF and LFI candidates. Recon itself always runs in full; "
+        "this only narrows what triage does with its output.",
+    )
+    for cls in FUZZ_CLASSES + MANUAL_CLASSES:
+        flag = "--" + cls["slug"].replace("_", "-")
+        vuln_group.add_argument(flag, action="store_true", dest=f"vuln_{cls['slug']}", help=f"Restrict triage to (at least) {cls['slug']} candidates")
+
     parser.add_argument("--discord", action="store_true", help="Send a clean summary to Discord via `notify` when done")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     parser.add_argument("--quiet", action="store_true", help="Suppress the banner")
@@ -871,11 +924,27 @@ def main():
         banner()
     info("Only scan assets you are authorised to test.")
 
+    # Report wording defaults to Caido's even when --proxy isn't set (no
+    # live warm-up this run) — RECOMMENDATIONS.md still needs some tool's
+    # terminology for its "how to follow up" guidance.
+    terms = PROXY_TOOLS[args.proxy] if args.proxy else PROXY_TOOLS["caido"]
+
+    selected_slugs = [cls["slug"] for cls in FUZZ_CLASSES + MANUAL_CLASSES if getattr(args, f"vuln_{cls['slug']}")]
+    if selected_slugs:
+        active_fuzz_classes = [c for c in FUZZ_CLASSES if c["slug"] in selected_slugs]
+        active_manual_classes = [c for c in MANUAL_CLASSES if c["slug"] in selected_slugs]
+        skipped_classes = [c["slug"] for c in FUZZ_CLASSES + MANUAL_CLASSES if c["slug"] not in selected_slugs]
+        info(f"vulnerability-class filter active — triaging only: {', '.join(selected_slugs)}")
+    else:
+        active_fuzz_classes = FUZZ_CLASSES
+        active_manual_classes = MANUAL_CLASSES
+        skipped_classes = []
+
     outdir_target, target_label = determine_target_and_label(args.target, args.list_file)
 
     required_tools = ["gf", "nuclei", "httpx", "anew"]
-    if not args.no_caido_warmup:
-        required_tools.append("curl")  # only caido_warmup() shells out to curl
+    if args.proxy:
+        required_tools.append("curl")  # only proxy_warmup() shells out to curl
     which_or_die(required_tools)
 
     outdir = resolve_outdir(outdir_target, args.indir)
@@ -917,9 +986,10 @@ def main():
         if dropped:
             warn(f"{dropped} out-of-scope URL(s) filtered out of all_urls.txt — {url_count} remain")
 
-    gf_counts = gf_triage(all_urls, triage_dir)
+    scanned_classes = active_fuzz_classes + active_manual_classes + [EXT_CLASS]
+    gf_counts = gf_triage(all_urls, triage_dir, scanned_classes)
     success("GF triage complete")
-    for cls in GF_ALL:
+    for cls in scanned_classes:
         detail(f"{cls['slug']}: {gf_counts[cls['slug']]}")
 
     ext_live_count = check_interesting_ext_live(triage_dir, args.rate, args.headers)
@@ -956,7 +1026,7 @@ def main():
         host_out = nuclei_host_scan(alive_path, nuclei_dir, args.rate, args.headers)
     cors_out = nuclei_cors_scan(alive_path, nuclei_dir, args.rate, args.headers)
     cors_findings = parse_nuclei_jsonl([cors_out] if cors_out else [])
-    class_outs = nuclei_class_scans(triage_dir, nuclei_dir, args.rate, args.headers, args.max_candidates)
+    class_outs = nuclei_class_scans(triage_dir, nuclei_dir, args.rate, active_fuzz_classes, args.headers, args.max_candidates)
     all_paths = ([host_out] if host_out else []) + [p for _, p in class_outs]
     findings = parse_nuclei_jsonl(all_paths) + cors_findings
     success(f"nuclei complete — {len(findings)} finding(s)")
@@ -975,18 +1045,18 @@ def main():
     findings = findings + takeover_findings  # same schema (template_id/severity/name/matched_at) — one findings list from here on
 
     phase("MANUAL TESTING QUEUE")
-    manual_path, manual_count = build_manual_review(triage_dir)
+    manual_path, manual_count = build_manual_review(triage_dir, active_manual_classes)
     success(f"{manual_count} URLs staged in {manual_path}")
 
     warmed_up = False
-    if manual_count and not args.no_caido_warmup:
+    if manual_count and args.proxy:
         # 1/rate keeps this phase's pacing consistent with -rate-limit
         # everywhere else in the pipeline, unless the caller overrode it.
-        caido_delay = args.caido_delay if args.caido_delay is not None else 1.0 / max(args.rate, 1)
-        caido_warmup(manual_path, args.caido_proxy, args.caido_timeout, caido_delay, args.headers)
+        proxy_delay = args.proxy_delay if args.proxy_delay is not None else 1.0 / max(args.rate, 1)
+        proxy_warmup(manual_path, PROXY_ADDRESS, args.proxy_timeout, proxy_delay, terms, args.headers)
         warmed_up = True
-    elif args.no_caido_warmup:
-        info("--no-caido-warmup set — leaving manual_review.txt for you to import by hand")
+    elif not args.proxy:
+        info("--proxy not set — leaving manual_review.txt for you to import by hand")
 
     phase("DIFF AGAINST LAST RUN")
     dangerous_ext_list = (triage_dir / "interestingEXT_dangerous.txt").read_text(errors="ignore").splitlines() \
@@ -1027,11 +1097,13 @@ def main():
         js_count, secret_findings, findings, manual_count, warmed_up,
         prev_state is not None, new_findings, new_secrets, new_dangerous, new_manual,
         takeover_findings, cors_findings,
+        terms, active_fuzz_classes + active_manual_classes, skipped_classes,
     )
     json_path = write_json_summary(
         triage_dir, target_label, url_count, gf_counts, ext_live_count, dangerous_count,
         js_count, secret_findings, findings, manual_count,
         prev_state is not None, new_findings, new_secrets, new_dangerous, new_manual,
+        skipped_classes,
     )
 
     if args.discord:

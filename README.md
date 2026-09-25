@@ -2,7 +2,7 @@
 
 ### Recon, Parameter, and Vulnerability Triage Engine
 
-Talon is a self-contained pipeline: domain in, triaged vulnerability candidates and a Caido-ready manual-review queue out. It owns the whole chain end to end — subdomain discovery, alive-host detection, DNS resolution, HTTP fingerprinting, port discovery, crawling, historical URL collection, parameter discovery, GF pattern triage, nuclei scanning, JS secret scanning, and reporting.
+Talon is a self-contained pipeline: domain in, triaged vulnerability candidates and a manual-review queue warmed up in Caido or Burp Suite out. It owns the whole chain end to end — subdomain discovery, alive-host detection, DNS resolution, HTTP fingerprinting, port discovery, crawling, historical URL collection, parameter discovery, GF pattern triage, nuclei scanning, JS secret scanning, and reporting.
 
 It calls the underlying recon tools (subfinder, httpx, dnsx, naabu, katana, assetfinder, findomain, subfaster, waymore, paramspider) directly — no wrapper layer, no intermediate process, no other tool required.
 
@@ -11,12 +11,13 @@ It calls the underlying recon tools (subfinder, httpx, dnsx, naabu, katana, asse
 ## What It Does
 
 - **Recon** (`recon.py`) — subdomain discovery from 7 sources, run concurrently (hackertarget, agniops, subfinder, urlscan, assetfinder, findomain, subfaster), alive-host detection, DNS resolution, HTTP fingerprinting, port discovery, katana crawling and waymore historical URLs merged and scope-filtered, and parameter discovery (URL-derived plus paramspider, parallelized across `--param-jobs` workers)
-- **Scope filter** *(optional, `--scope-file`)* — drops anything outside an explicit in-scope allowlist before a single request goes out to fuzzing, JS scanning, or Caido
+- **Scope filter** *(optional, `--scope-file`)* — drops anything outside an explicit in-scope allowlist before a single request goes out to fuzzing, JS scanning, or the proxy warm-up
 - **GF pattern triage** — buckets endpoints and params into vuln-class candidates (xss, sqli, ssrf, lfi, rce, ssti, redirect, idor, interestingparams, debug_logic, img-traversal)
+- **Vulnerability-class filter** *(optional, `--xss`/`--ssrf`/`--lfi`/etc.)* — recon always runs in full, but triage (gf matching, nuclei fuzzing, and the manual queue) can be narrowed to just the classes you flag, e.g. `--ssrf --lfi` skips every other class entirely instead of triaging all 11 every run
 - **Live-exposure check** with high-risk extension filtering (`.git`, `.env`, `.sql`, `.bak`, etc. — separated from ordinary public files)
 - **JS secret scan** — fetches every `.js` URL via httpx's native `-extract-regex` (no hand-rolled curl loop) and checks it against known secret formats (AWS/Google/Stripe/Slack/GitHub keys, JWTs, private key blocks, generic `api_key=` assignments)
 - **nuclei** — a host-level `severity:critical` sweep, a dedicated CORS misconfig pass, a per-class pass scoped to generic parameter-injection templates (not every CVE template with that tag — measured 67x fewer requests than unrestricted tag matching, same real coverage), and a subdomain-takeover pass (73 templates). DoS-tagged templates are always excluded via `-etags dos`, since most programs prohibit DoS testing
-- **Manual-testing queue** with optional Caido proxy warm-up for everything nuclei can't fingerprint on its own (IDOR, feature-flag logic, confirmed secrets, possible takeovers, "worth a closer look" params)
+- **Manual-testing queue** with optional proxy warm-up (`--proxy caido` or `--proxy burp`) for everything nuclei can't fingerprint on its own (IDOR, feature-flag logic, confirmed secrets, possible takeovers, "worth a closer look" params)
 - **Run-over-run diff** — every run is compared against the last one for the same target; `RECOMMENDATIONS.md` leads with a "New Since Last Run" section so re-running against a program you're already watching doesn't mean re-reading everything
 - A data-driven `RECOMMENDATIONS.md` that only shows guidance for classes that actually had candidates, not static boilerplate
 - **One live progress bar per phase** — on a real terminal, each tool's status redraws in place with no scrollback spam; when output is piped, redirected, or logged (where in-place redraw doesn't survive), it automatically falls back to a handful of milestone lines instead of a wall of broken fragments
@@ -50,7 +51,7 @@ recon.py — subdomains → alive → DNS → ports → crawl+waymore → params
                          manual_review.txt
                                   │
                                   ▼
-                     Caido proxy warm-up (optional)
+              Caido or Burp proxy warm-up (optional)
                                   │
                                   ▼
                   diff vs. talon_state.json (last run)
@@ -82,18 +83,18 @@ The installer sets up everything: Go, the recon toolchain (subfinder/httpx/dnsx/
 | `--param-jobs` | Parallel paramspider workers during recon (default: 5) |
 | `--scope-file` | One in-scope domain per line (apex or `*.sub.domain`), or a HackerOne scope CSV export (`.csv` extension). Filters `all_urls.txt` and `fresh_alive_domains` before anything downstream touches them |
 | `--rate` | nuclei/httpx `-rate-limit` (default: 50 — this is live production infrastructure, not a lab box) |
-| `-H, --header` | Custom header added to every live HTTP request Talon makes — recon (httpx/katana), triage (httpx/nuclei), and the Caido warm-up (curl). Repeatable, e.g. `-H 'X-HackerOne-Researcher: yourname'` |
-| `--caido-proxy` | Caido proxy address (default: `http://127.0.0.1:8080`) |
-| `--caido-timeout` | Per-request curl `--max-time` for the Caido warm-up, seconds (default: 10) |
-| `--caido-delay` | Delay between Caido warm-up requests, seconds (default: 0.2) |
-| `--no-caido-warmup` | Build `manual_review.txt` but don't route it through Caido (also drops the `curl` requirement, since that's its only caller) |
+| `-H, --header` | Custom header added to every live HTTP request Talon makes — recon (httpx/katana), triage (httpx/nuclei), and the proxy warm-up (curl). Repeatable, e.g. `-H 'X-HackerOne-Researcher: yourname'` |
+| `--proxy` | `caido` or `burp` — routes the manual-review queue through that tool's warm-up (`curl -x http://127.0.0.1:8080`; both tools default to that same address, so there's no separate address flag) and picks the wording used in progress messages and `RECOMMENDATIONS.md` (Caido Replay/Sitemap vs. Burp Repeater/HTTP history). Omit to skip the warm-up entirely (default — also drops the `curl` requirement, since that's its only caller) |
+| `--proxy-timeout` | Per-request curl `--max-time` for the proxy warm-up, seconds (default: 10) |
+| `--proxy-delay` | Delay between proxy warm-up requests, seconds (default: 0.2) |
+| `--xss`, `--sqli`, `--ssrf`, `--lfi`, `--ssti`, `--img-traversal`, `--redirect`, `--idor`, `--interestingparams`, `--debug-logic`, `--rce` | Opt-in vulnerability-class filter. With none set, every class is triaged (default). Set one or more to restrict gf triage + nuclei fuzzing + the manual queue to just those classes — recon itself is unaffected |
 | `--no-js-scan` | Skip fetching `.js` files and scanning them for hardcoded secrets |
 | `--no-host-scan` | Skip the all-host `severity:critical` CVE/misconfig sweep — the expensive one (roughly 1,870 templates times every alive host, hours on a large target). CORS, takeover, and per-class fuzzing passes still run and are the faster, higher-signal ones anyway |
 | `--discord` | Send a clean one-line summary via `notify` when done (requires a configured provider at `~/.config/notify/provider-config.yaml`) |
 | `-v, --verbose` | Verbose logging (debug-level subprocess command traces) |
 | `--quiet` | Suppress the startup banner |
 
-### Full pipeline (recon, triage, nuclei, Caido queue)
+### Full pipeline (recon, triage, nuclei, proxy queue)
 
 ```bash
 talon -t example.com
@@ -113,11 +114,20 @@ talon -t $TARGET                # runs recon + triage
 talon -t $TARGET --skip-recon   # later — triage only, reusing results/$TARGET
 ```
 
-### Skip the Caido warm-up, just get the reports
+### Route the manual queue through Caido or Burp Suite
 
 ```bash
-talon -t example.com --no-caido-warmup
+talon -t example.com --proxy caido
+talon -t example.com --proxy burp
 ```
+The warm-up (`curl -x http://127.0.0.1:8080`) doesn't care which tool is listening — Caido and Burp Suite both default to that address — so `--proxy` only changes the wording in progress messages and `RECOMMENDATIONS.md` (Burp Repeater/HTTP history vs. Caido Replay/Sitemap). Without `--proxy`, Talon just builds `manual_review.txt` and leaves it for you to import by hand — that's the default.
+
+### Only triage specific vulnerability classes
+
+```bash
+talon -t example.com --ssrf --lfi
+```
+Recon still runs in full — this only narrows what triage does afterward: gf triage, nuclei fuzzing, and the manual-review queue are restricted to the flagged classes (here, SSRF and LFI candidates only). With no class flags set, every class is triaged, same as today.
 
 ### Skip the slow all-host CVE sweep on a large target
 
@@ -156,7 +166,7 @@ talon -l scope_export.csv --scope-file scope_export.csv
 ```bash
 talon -t example.com -H "X-HackerOne-Researcher: yourname"
 ```
-Repeatable — pass `-H` multiple times for more than one header. Applied to every live HTTP request Talon sends (recon's httpx/katana calls, triage's httpx/nuclei calls, and the curl-based Caido warm-up) so program owners can distinguish your traffic in their logs.
+Repeatable — pass `-H` multiple times for more than one header. Applied to every live HTTP request Talon sends (recon's httpx/katana calls, triage's httpx/nuclei calls, and the curl-based proxy warm-up) so program owners can distinguish your traffic in their logs.
 
 ### Recurring monitoring of the same program
 
@@ -198,7 +208,7 @@ And in `results/<target>/triage/`:
 | `nuclei/*.jsonl` | Raw nuclei output — host-level, CORS, takeover, and per-class passes |
 | `manual_review.txt` | Deduped queue of everything nuclei can't fingerprint on its own |
 | `talon_state.json` | Snapshot of this run's findings, used to compute the "New Since Last Run" diff on the next run |
-| `RECOMMENDATIONS.md` | Human-readable report — new-since-last-run, counts, nuclei findings table, and dedicated Caido guidance per vuln class, plus takeover and CORS findings (only sections with actual findings are shown) |
+| `RECOMMENDATIONS.md` | Human-readable report — new-since-last-run, counts, nuclei findings table, and dedicated per-vuln-class guidance worded for Caido or Burp Suite (`--proxy`), plus takeover and CORS findings (only sections with actual findings are shown) |
 | `talon_summary.json` | The same data, structured, for chaining into other tooling |
 
 ---
@@ -208,7 +218,7 @@ And in `results/<target>/triage/`:
 Talon shells out to:
 
 **Recon** — subfinder, httpx, dnsx, naabu, katana, assetfinder, findomain, subfaster, waymore, paramspider, anew
-**Triage** — gf (needs `~/.gf` populated, see below), nuclei, httpx, anew, and curl (only required unless `--no-caido-warmup` is set, since that's the only thing that calls curl)
+**Triage** — gf (needs `~/.gf` populated, see below), nuclei, httpx, anew, and curl (only required when `--proxy` is set, since that's the only thing that calls curl)
 **Optional** — notify (only used with `--discord`)
 
 GF ships with zero patterns of its own — `Installer.sh` clones [1ndianl33t/Gf-Patterns](https://github.com/1ndianl33t/Gf-Patterns) into `~/.gf` if it's not already there.
