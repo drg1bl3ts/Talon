@@ -281,6 +281,222 @@ def parse_tech_domains(tech_path: Path) -> dict[str, list[str]]:
             result[host.lower()] = techs
     return result
 
+
+# WordPress core auto-appends ?ver=X.Y.Z to its own default enqueued
+# scripts/styles, and this survives most hardening efforts (removing it
+# means actively filtering every core asset's query string, which most
+# hardened/managed hosts don't bother with) — wp-emoji-release.min.js is
+# THE standard tell for this, confirmed hands-on this session against a
+# WordPress VIP instance that had stripped every other version-disclosure
+# vector (generator meta tag, readme.html). Plugin/mu-plugin versions
+# follow the same convention, or (mu-plugins specifically) are embedded
+# directly in the directory name, as Jetpack's install does.
+_WP_CORE_VER_RE = re.compile(r"wp-includes/js/wp-emoji-release\.min\.js\?ver=([0-9][0-9.]*)", re.IGNORECASE)
+_WP_PLUGIN_VER_RE = re.compile(r"wp-content/plugins/([a-zA-Z0-9_-]+)/[^\s\"']*\?ver=([0-9][0-9.]*)", re.IGNORECASE)
+_WP_MUPLUGIN_VER_RE = re.compile(r"wp-content/mu-plugins/([a-zA-Z0-9_-]+)-([0-9][0-9.]+)/", re.IGNORECASE)
+# Plugin slug -> display name for the handful worth naming cleanly instead
+# of printing the raw directory slug. Extend as new plugins turn up on
+# real targets — this is deliberately small, not an attempt at a complete
+# WordPress plugin directory.
+_WP_PLUGIN_DISPLAY_NAMES = {"jetpack": "Jetpack", "gravityforms": "Gravity Forms"}
+
+# Drupal's CHANGELOG.txt has shipped the exact version on its first line
+# since Drupal 4.x — core/CHANGELOG.txt on Drupal 8+, bare /CHANGELOG.txt
+# on Drupal 7 and earlier (core files moved under core/ in the 8.0
+# reorganization). Verified technique, not guessed — real security
+# scanners (Drupal Scanner et al.) use exactly this file.
+_DRUPAL_CHANGELOG_PATHS = ("/core/CHANGELOG.txt", "/CHANGELOG.txt")
+_DRUPAL_VER_RE = re.compile(r"Drupal\s+([0-9][0-9.]*)\s*,", re.IGNORECASE)
+
+# /administrator/manifests/files/joomla.xml is world-readable on a default
+# Joomla install and its <version> tag is the exact running version — the
+# same technique this session verified via docs.joomla.org / community
+# write-ups. langmetadata.xml (Joomla 4/5) and README.txt are documented
+# fallbacks but not implemented here; add them if this one turns out
+# stripped on a real target.
+_JOOMLA_MANIFEST_PATH = "/administrator/manifests/files/joomla.xml"
+_JOOMLA_VER_RE = re.compile(r"<version>\s*([0-9][0-9.]*)\s*</version>", re.IGNORECASE)
+
+# CMSeeK is a git-clone tool (not package-manager installed), so its
+# presence is checked at call time rather than required via which_or_die —
+# Talon degrades gracefully (CMS detection simply doesn't run) rather than
+# hard-failing for anyone who hasn't cloned it.
+CMSEEK_PATH = Path.home() / "Tools" / "CMSeeK" / "cmseek.py"
+CMSEEK_RESULT_DIR = Path.home() / "Tools" / "CMSeeK" / "Result"
+CMSEEK_MAX_HOSTS = 25  # each call spawns a real subprocess (~0.4-1s), not just one HTTP request — bound worst case on a URL-rich target the same spirit as --max-candidates
+
+
+def detect_cms_names(alive_path: Path, triage_dir: Path, headers: list[str] | None,
+                      max_hosts: int = CMSEEK_MAX_HOSTS, timeout: int = 30) -> dict[str, str]:
+    """Runs CMSeeK's --light-scan (CMS name + version detection only, NOT
+    its default deep-scan mode — deep-scan does user/theme enumeration,
+    44 requests against a real WordPress target in this session's testing,
+    too invasive for a pass that runs by default) against every alive/
+    in-scope host — NOT apex-deduped like waf_detect(), since different
+    subdomains of the same apex can genuinely run different CMSs (a blog
+    vs. a shop, say).
+
+    No proxy passthrough: verified via `cmseek.py -h` that CMSeeK has no
+    -x/--proxy flag at all (checked, not assumed) — its traffic can't be
+    routed through Caido/Burp the way every other probe in this file is.
+
+    CMSeeK writes its own Result/<host>/cms.json outside Talon's results
+    tree; each host's json is copied into triage_dir/cmseek/ (keeping
+    Talon's own output self-contained) and the original Result/<host>
+    directory is removed afterward.
+
+    Returns {host: cms_name} — e.g. {"corporate.abercrombie.com":
+    "WordPress"}. Version numbers are NOT reliable from CMSeeK itself
+    (confirmed hands-on: no version field even for a WordPress host this
+    session's own ?ver= technique correctly fingerprinted) — that's
+    fingerprint_cms_versions()'s job, dispatched per detected CMS name."""
+    if not CMSEEK_PATH.exists():
+        info(f"CMSeeK not found at {CMSEEK_PATH} — CMS detection skipped (git clone https://github.com/Tuhinshubhra/CMSeeK there to enable it)")
+        return {}
+    if not alive_path.exists():
+        return {}
+    hosts = sorted({line_hostname(l) for l in alive_path.read_text(errors="ignore").splitlines() if l.strip()} - {""})
+    if not hosts:
+        return {}
+    if len(hosts) > max_hosts:
+        warn(f"{len(hosts)} alive host(s) — CMSeeK capped to the first {max_hosts} (each scan spawns a real subprocess, not just one request)")
+        hosts = hosts[:max_hosts]
+
+    cmseek_dir = triage_dir / "cmseek"
+    cmseek_dir.mkdir(exist_ok=True)
+    results: dict[str, str] = {}
+    progress = Progress("cmseek:detect")
+    for i, host in enumerate(hosts, 1):
+        progress.update(f"{i}/{len(hosts)} host(s)", percent=100 * (i - 1) / len(hosts))
+        cmd = ["python3", str(CMSEEK_PATH), "-u", f"https://{host}", "--light-scan", "--batch"]
+        for h in resolved_headers(headers):
+            if h.lower().startswith("user-agent:"):
+                cmd += ["--user-agent", h.split(":", 1)[1].strip()]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout, cwd=str(CMSEEK_PATH.parent))
+        except subprocess.TimeoutExpired:
+            warn(f"cmseek timed out against {host}")
+            continue
+        result_json = CMSEEK_RESULT_DIR / host / "cms.json"
+        if result_json.exists():
+            try:
+                data = json.loads(result_json.read_text())
+            except json.JSONDecodeError:
+                data = {}
+            name = data.get("cms_name")
+            if name:
+                results[host] = name
+                (cmseek_dir / f"{host}.json").write_text(json.dumps(data, indent=2))
+            shutil.rmtree(CMSEEK_RESULT_DIR / host, ignore_errors=True)
+        if i < len(hosts):
+            time.sleep(1)
+    progress.stop(f"{GREEN}[{ts()}] ✓{RESET} cmseek:detect complete — {len(results)} CMS identified across {len(hosts)} host(s)")
+    return results
+
+
+def _fetch_version_from_path(host: str, path: str, pattern: re.Pattern, proxy: str | None,
+                              headers: list[str] | None, timeout: int) -> str | None:
+    """Shared shape for the Drupal/Joomla live-fetch-and-regex checks —
+    same one-request-per-host, proxy/header-respecting curl pattern as
+    check_wordpress_xmlrpc(), just GET-a-fixed-path-and-regex instead of
+    POST-an-XML-RPC-body."""
+    cmd = ["curl", "-sk", "--max-time", str(timeout), f"https://{host}{path}"]
+    if proxy:
+        cmd += ["-x", proxy]
+    cmd += header_args(headers)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout + 10)
+    except subprocess.TimeoutExpired:
+        return None
+    m = pattern.search(proc.stdout or "")
+    return m.group(1) if m else None
+
+
+def fingerprint_cms_versions(endpoints_path: Path, cms_by_host: dict[str, str], proxy: str | None,
+                              headers: list[str] | None, timeout: int = 15) -> dict[str, dict[str, str]]:
+    """Per-CMS version extraction, dispatched on what detect_cms_names()
+    (CMSeeK) identified each host as running. Each CMS gets its own
+    verified technique rather than one generic guess:
+      - WordPress: batch-parsed from already-crawled endpoints via ?ver=
+        query strings (existing, tested logic — no live requests needed).
+      - Drupal / Joomla: one live GET per host against a known-readable
+        version-disclosure file (CHANGELOG.txt / joomla.xml respectively),
+        same throttled/proxied convention as check_wordpress_xmlrpc().
+      - Magento and anything else CMSeeK identifies but this function has
+        no branch for: deliberately NOT attempted. Real Magento version
+        fingerprinting needs file-hash matching against a version
+        database (why dedicated tools like MageVersion exist) — a simple
+        regex would fabricate false confidence. The CMS NAME still
+        surfaces in Quick Reference via cms_by_host; it just won't have
+        a version number.
+    Adding a new CMS's version technique is one more branch here, not a
+    restructure — that's the point of dispatching on cms_by_host rather
+    than hardcoding "if wordpress" the way this used to.
+
+    Returns {host: {component_name: version}} — WordPress hosts may have
+    multiple component entries (core + plugins); Drupal/Joomla hosts have
+    at most one."""
+    versions: dict[str, dict[str, str]] = {}
+
+    wp_hosts = {h for h, cms in cms_by_host.items() if cms == "WordPress"}
+    if wp_hosts and endpoints_path.exists():
+        # Collect every candidate per (host, plugin) rather than keeping
+        # the first match — plugin webpack bundles frequently ship OTHER
+        # assets with their own unrelated ?ver= cache-bust numbers (a bare
+        # build counter like "69" or "0", not the plugin's actual release
+        # version), and those can easily sort earlier in a crawl than the
+        # asset that carries the real one. Picking "the first ?ver= seen"
+        # got Gravity Forms wrong in exactly this way the first time this
+        # ran against real data — a bare integer build number, not "3.1.2".
+        candidates: dict[str, dict[str, set[str]]] = {}
+        for line in endpoints_path.read_text(errors="ignore").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            host = line_hostname(line)
+            if host not in wp_hosts:
+                continue
+            host_candidates = candidates.setdefault(host, {})
+            m = _WP_CORE_VER_RE.search(line)
+            if m:
+                host_candidates.setdefault("WordPress", set()).add(m.group(1))
+            m = _WP_PLUGIN_VER_RE.search(line)
+            if m:
+                name = _WP_PLUGIN_DISPLAY_NAMES.get(m.group(1).lower(), m.group(1))
+                host_candidates.setdefault(name, set()).add(m.group(2))
+            m = _WP_MUPLUGIN_VER_RE.search(line)
+            if m:
+                name = _WP_PLUGIN_DISPLAY_NAMES.get(m.group(1).lower(), m.group(1))
+                host_candidates.setdefault(name, set()).add(m.group(2))
+
+        def best(vers: set[str]) -> str:
+            # A real WP/plugin release version has at least one dot
+            # ("3.1.2"); a bare build/cache-bust counter ("69", "0")
+            # doesn't. Prefer dotted candidates; among those, the longest
+            # (most specific, e.g. "3.1.2" over "3.1") wins; fall back to
+            # a bare integer only when nothing dotted was ever found.
+            dotted = [v for v in vers if "." in v]
+            pool = dotted or list(vers)
+            return max(pool, key=len)
+
+        for host, plugins in candidates.items():
+            if plugins:
+                versions[host] = {name: best(vers) for name, vers in plugins.items()}
+
+    for host in sorted(h for h, cms in cms_by_host.items() if cms == "Drupal"):
+        for path in _DRUPAL_CHANGELOG_PATHS:
+            ver = _fetch_version_from_path(host, path, _DRUPAL_VER_RE, proxy, headers, timeout)
+            if ver:
+                versions.setdefault(host, {})["Drupal"] = ver
+                break
+
+    for host in sorted(h for h, cms in cms_by_host.items() if cms == "Joomla"):
+        ver = _fetch_version_from_path(host, _JOOMLA_MANIFEST_PATH, _JOOMLA_VER_RE, proxy, headers, timeout)
+        if ver:
+            versions.setdefault(host, {})["Joomla"] = ver
+
+    return versions
+
 # The warm-up itself is just `curl -x <proxy>` — mechanically identical for
 # Caido and Burp Suite, and both default to listening on this same address,
 # so there's no separate --proxy-address flag to keep in sync. The only
@@ -740,6 +956,213 @@ def waf_detect(alive_path: Path, triage_dir: Path, proxy: str | None, headers: l
     return results
 
 
+_XMLRPC_PROBE_BODY = '<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName><params></params></methodCall>'
+
+
+def check_wordpress_xmlrpc(cms_by_host: dict[str, str], proxy: str | None,
+                            headers: list[str] | None, timeout: int = 15) -> list[dict]:
+    """xmlrpc.php is a fixed, unlinked path — no crawler ever finds it via
+    links, so it's invisible to GF/nuclei's URL-based triage entirely
+    unless something checks the well-known path directly. This calls
+    system.listMethods ONLY (a read-only capability listing, one request
+    per WordPress-detected host) to check whether XML-RPC is enabled at
+    all and whether pingback.ping is among the exposed methods —
+    pingback.ping is a textbook, well-documented WordPress SSRF primitive
+    (it takes a sourceURI/targetURI pair and the server fetches sourceURI
+    server-side to verify the pingback).
+
+    Deliberately does NOT invoke pingback.ping itself — that actually
+    triggers a real outbound fetch from the target, which is a manual
+    decision for a human to make on a specific host, not something this
+    pass should do unattended against every WordPress target it finds.
+    This function only answers "is the primitive present," the same way
+    wafw00f only answers "is a WAF present" without trying to exploit it."""
+    wp_hosts = sorted({h for h, cms in cms_by_host.items() if cms == "WordPress"})
+    if not wp_hosts:
+        return []
+    results = []
+    for host in wp_hosts:
+        cmd = ["curl", "-sk", "--max-time", str(timeout), "-X", "POST",
+               f"https://{host}/xmlrpc.php", "--data-binary", _XMLRPC_PROBE_BODY]
+        if proxy:
+            cmd += ["-x", proxy]
+        cmd += header_args(headers)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout + 10)
+        except subprocess.TimeoutExpired:
+            warn(f"xmlrpc.php probe timed out against {host}")
+            continue
+        body = proc.stdout or ""
+        if "<methodResponse>" not in body and "methodName" not in body:
+            continue  # not live, or not actually XML-RPC (404/redirect/WAF block page)
+        results.append({
+            "host": host,
+            "xmlrpc_live": True,
+            "pingback_exposed": "pingback.ping" in body,
+        })
+    return results
+
+
+# Both wordlists confirmed present on this system (SecLists, pacman package
+# seclists-2026.1-1, /usr/share/seclists) — not bundled/downloaded by Talon
+# itself. If SecLists isn't installed on a machine this runs on, both
+# passes skip with a clear warning rather than silently picking some other
+# wordlist unilaterally.
+VHOST_WORDLIST = Path("/usr/share/seclists/Discovery/DNS/combined_subdomains.txt")
+DIRBRUTE_WORDLIST = Path("/usr/share/seclists/Discovery/Web-Content/common.txt")
+
+
+def vhost_fuzz(alive_path: Path, triage_dir: Path, rate: int, proxy: str | None,
+               headers: list[str] | None, wordlist: Path = VHOST_WORDLIST, timeout: int = 10) -> list[str]:
+    """--vhost-fuzz only (opt-in, off by default — this is thousands of
+    requests against a single host, an entirely different volume class
+    than anything else in this pipeline, and this session hit real
+    rate-limit blocks TWICE from under-throttled scanning already).
+
+    One representative host per apex (same dedup as waf_detect() — vhost
+    fuzzing targets the web server's virtual-hosting configuration at the
+    apex level, not something that varies per already-known subdomain).
+    Sends every wordlist entry as `Host: FUZZ.<apex>` against that apex's
+    own root URL, filtered against the response size of an obviously-
+    nonexistent vhost (ffuf -fs) so only genuinely DIFFERENT responses —
+    a real vhost that isn't in DNS and was never crawled — surface as
+    hits, not just "the default vhost every unmatched Host: header falls
+    back to."
+
+    Writes triage/vhosts_found.txt. Returns the list of found vhost
+    hostnames (empty if the wordlist is missing or nothing hit)."""
+    if not wordlist.exists():
+        warn(f"vhost wordlist not found at {wordlist} (SecLists not installed?) — --vhost-fuzz skipped")
+        return []
+    if not alive_path.exists():
+        return []
+    hosts_by_apex: dict[str, str] = {}
+    for line in alive_path.read_text(errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        host = line_hostname(line)
+        if not host:
+            continue
+        hosts_by_apex.setdefault(_apex_group(host), line)
+    targets = sorted(hosts_by_apex.values())
+    if not targets:
+        return []
+
+    all_hits: list[str] = []
+    progress = Progress("ffuf:vhost")
+    for i, base_url in enumerate(targets, 1):
+        progress.update(f"{i}/{len(targets)} apex host(s)", percent=100 * (i - 1) / len(targets))
+        parsed = urlparse(base_url)
+        hostname = parsed.hostname or ""
+        apex = _apex_group(hostname)
+        root_url = f"{parsed.scheme or 'https'}://{hostname}/"
+
+        baseline_cmd = [
+            "curl", "-sk", "-o", "/dev/null", "-w", "%{size_download}", "--max-time", str(timeout),
+            "-H", f"Host: talon-nonexistent-vhost-check-{random.randint(100000, 999999)}.{apex}", root_url,
+        ]
+        if proxy:
+            baseline_cmd += ["-x", proxy]
+        baseline_cmd += header_args(headers)
+        try:
+            proc = subprocess.run(baseline_cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout + 10)
+            baseline_size = proc.stdout.strip() or "0"
+        except subprocess.TimeoutExpired:
+            warn(f"vhost baseline probe timed out against {hostname} — skipping")
+            continue
+
+        out = triage_dir / f".vhost_ffuf_{apex}.json"
+        cmd = [
+            "ffuf", "-w", f"{wordlist}:FUZZ", "-u", root_url, "-H", f"Host: FUZZ.{apex}",
+            "-fs", baseline_size, "-rate", str(rate), "-o", str(out), "-of", "json",
+            "-noninteractive", "-s",
+        ] + header_args(headers)
+        if proxy:
+            cmd += ["-x", proxy]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        except Exception as e:
+            warn(f"ffuf vhost fuzz failed against {apex}: {e}")
+            continue
+        if out.exists():
+            try:
+                data = json.loads(out.read_text())
+                for r in data.get("results", []):
+                    word = (r.get("input") or {}).get("FUZZ")
+                    if word:
+                        all_hits.append(f"{word}.{apex}")
+            except json.JSONDecodeError:
+                pass
+            out.unlink(missing_ok=True)
+    progress.stop(f"{GREEN}[{ts()}] ✓{RESET} ffuf:vhost complete — {len(all_hits)} vhost(s) found across {len(targets)} apex host(s)")
+
+    result_file = triage_dir / "vhosts_found.txt"
+    result_file.write_text("\n".join(sorted(all_hits)) + ("\n" if all_hits else ""))
+    return sorted(all_hits)
+
+
+def dir_brute(alive_path: Path, triage_dir: Path, rate: int, proxy: str | None,
+              headers: list[str] | None, wordlist: Path = DIRBRUTE_WORDLIST, depth: int = 2,
+              timeout: int = 7) -> list[str]:
+    """--dir-brute only (opt-in, off by default — same volume/rate-limit-
+    risk reasoning as vhost_fuzz(), a full recursive content discovery
+    scan is thousands of requests per host, not the 1-2 request footprint
+    everything else in this pipeline has).
+
+    Runs feroxbuster per ALIVE/IN-SCOPE HOST (not apex-deduped — different
+    subdomains genuinely have different directory structures, unlike
+    vhost fuzzing which is a property of the web server's vhost config at
+    the apex). Depth-limited (default 2) so a large site can't turn this
+    into an unbounded recursive crawl.
+
+    Writes triage/dirbrute_findings.txt. Returns the list of found URLs
+    (empty if the wordlist is missing or nothing found)."""
+    if not wordlist.exists():
+        warn(f"directory wordlist not found at {wordlist} (SecLists not installed?) — --dir-brute skipped")
+        return []
+    if not alive_path.exists():
+        return []
+    targets = sorted({l.strip() for l in alive_path.read_text(errors="ignore").splitlines() if l.strip()})
+    if not targets:
+        return []
+
+    all_hits: list[str] = []
+    progress = Progress("feroxbuster:dirbrute")
+    for i, base_url in enumerate(targets, 1):
+        progress.update(f"{i}/{len(targets)} host(s)", percent=100 * (i - 1) / len(targets))
+        out = triage_dir / f".ferox_{i}.jsonl"
+        cmd = [
+            "feroxbuster", "-u", base_url, "-w", str(wordlist), "--rate-limit", str(rate),
+            "-d", str(depth), "--json", "-o", str(out), "-q", "--silent", "-k",
+            "-T", str(timeout),
+        ] + header_args(headers)
+        if proxy:
+            cmd += ["-p", proxy]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        except Exception as e:
+            warn(f"feroxbuster failed against {base_url}: {e}")
+            continue
+        if out.exists():
+            for line in out.read_text(errors="ignore").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("type") == "response" and rec.get("url"):
+                    all_hits.append(f"{rec['url']} [{rec.get('status')}]")
+            out.unlink(missing_ok=True)
+    progress.stop(f"{GREEN}[{ts()}] ✓{RESET} feroxbuster:dirbrute complete — {len(all_hits)} path(s) found across {len(targets)} host(s)")
+
+    result_file = triage_dir / "dirbrute_findings.txt"
+    result_file.write_text("\n".join(sorted(all_hits)) + ("\n" if all_hits else ""))
+    return sorted(all_hits)
+
+
 def naabu_service_triage(outdir: Path, triage_dir: Path, nuclei_dir: Path, rate: int,
                           headers: list[str] | None, candidate_classes: list, skip_confirm: bool) -> list[dict]:
     """Labels naabu.txt (currently write-only — recon.py writes it, nothing
@@ -984,7 +1407,8 @@ def severity_breakdown(findings) -> dict:
 
 def _quick_reference_section(
     triage_dir: Path, gf_counts: dict, waf_findings: list, tech_by_host: dict, port_findings: list,
-    ssrf_sink_hits: list | None = None,
+    ssrf_sink_hits: list | None = None, cms_versions: dict | None = None, xmlrpc_findings: list | None = None,
+    cms_by_host: dict | None = None, vhost_hits: list | None = None, dirbrute_hits: list | None = None,
 ) -> list[str]:
     """The consolidated top-of-report block: WAF/CDN, tech stack, ports of
     interest, and SSRF signal-vs-noise — the exact manual cross-referencing
@@ -1009,6 +1433,26 @@ def _quick_reference_section(
     all_tech = sorted({t for techs in tech_by_host.values() for t in techs})
     lines.append(f"**Tech stack:** {', '.join(all_tech) if all_tech else 'None fingerprinted'}")
 
+    cms_by_host = cms_by_host or {}
+    cms_versions = cms_versions or {}
+    if cms_by_host:
+        parts = []
+        for host in sorted(cms_by_host):
+            name = cms_by_host[host]
+            host_vers = cms_versions.get(host, {})
+            primary_ver = host_vers.get(name)
+            label = f"{name} {primary_ver}" if primary_ver else f"{name} (version undetected)"
+            extras = ", ".join(f"{n} {v}" for n, v in host_vers.items() if n != name)
+            if extras:
+                label += f" ({extras})"
+            parts.append(f"{host}: {label}")
+        lines.append(f"**CMS/versions:** {'; '.join(parts)}")
+
+    xmlrpc_findings = xmlrpc_findings or []
+    pingback_hosts = [xf["host"] for xf in xmlrpc_findings if xf["pingback_exposed"]]
+    if pingback_hosts:
+        lines.append(f"**XML-RPC:** pingback.ping exposed on {', '.join(pingback_hosts)} — classic WordPress SSRF primitive, not yet invoked (see Recommendations)")
+
     if port_findings:
         lines.append("**Ports of interest:**")
         for pf in port_findings:
@@ -1021,6 +1465,14 @@ def _quick_reference_section(
     else:
         lines.append("**Ports of interest:** None — no naabu-discovered port on a host that also has a vuln candidate")
 
+    vhost_hits = vhost_hits or []
+    if vhost_hits:
+        lines.append(f"**Vhosts found:** {len(vhost_hits)} — {', '.join(vhost_hits)} (see `triage/vhosts_found.txt`)")
+
+    dirbrute_hits = dirbrute_hits or []
+    if dirbrute_hits:
+        lines.append(f"**Directory brute-force:** {len(dirbrute_hits)} path(s) found — see `triage/dirbrute_findings.txt`")
+
     ssrf_raw = gf_counts.get("ssrf", 0)
     ssrf_nuclei = count_lines(triage_dir / "nuclei" / "nuclei_ssrf.jsonl")
     ssrf_sink_hits = ssrf_sink_hits or []
@@ -1031,6 +1483,13 @@ def _quick_reference_section(
             lines.append(f"- `{hit}`")
 
     rec_bullets = []
+    for host in pingback_hosts:
+        rec_bullets.append(
+            f"- `{host}` exposes XML-RPC `pingback.ping` — call it with `sourceURI`=your QuickSSRF/interactsh "
+            f"domain and `targetURI`=any real existing post URL on the host (pingback validates the target "
+            f"exists first). A callback confirms server-side fetch unambiguously; distinct XML-RPC fault codes "
+            f"on internal-range sourceURI values give semi-blind signal even without OOB."
+        )
     for f in waf_findings:
         fw = f.get("firewall", "the detected WAF")
         rec_bullets.append(
@@ -1064,7 +1523,8 @@ def write_recommendations_md(
     takeover_findings: list, cors_findings: list,
     terms: dict, classes: list, skipped_classes: list[str],
     waf_findings: list | None = None, tech_by_host: dict | None = None, port_findings: list | None = None,
-    ssrf_sink_hits: list | None = None,
+    ssrf_sink_hits: list | None = None, cms_versions: dict | None = None, xmlrpc_findings: list | None = None,
+    cms_by_host: dict | None = None, vhost_hits: list | None = None, dirbrute_hits: list | None = None,
 ) -> Path:
     sev = severity_breakdown(findings)
     lines = []
@@ -1077,6 +1537,7 @@ def write_recommendations_md(
 
     lines.extend(_quick_reference_section(
         triage_dir, gf_counts, waf_findings or [], tech_by_host or {}, port_findings or [], ssrf_sink_hits or [],
+        cms_versions or {}, xmlrpc_findings or [], cms_by_host or {}, vhost_hits or [], dirbrute_hits or [],
     ))
 
     if has_prev_run:
@@ -1304,6 +1765,9 @@ def main():
     parser.add_argument("--max-candidates", type=int, default=None, help="Cap each fuzz class's deduped candidate list to this many (random sample) before nuclei scans it — bounds worst-case runtime against a URL-rich target instead of scanning every unique injection point found. Default: unlimited.")
     parser.add_argument("--no-waf-detect", action="store_true", help="Skip the wafw00f WAF/CDN detection pass (one representative host per apex domain, ~2 requests each — fast, but skippable if wafw00f isn't installed or you already know the WAF)")
     parser.add_argument("--no-port-triage", action="store_true", help="Skip the nuclei network-protocol confirmation pass for naabu-discovered ports (the static port->service labeling and Quick Reference cross-referencing still run — only the extra nuclei -pt tcp scan is skipped)")
+    parser.add_argument("--no-cms-probe", action="store_true", help="Skip the xmlrpc.php live check on WordPress-detected hosts (CMS/plugin version fingerprinting from already-crawled ?ver= query strings still runs — only the one extra live request per WP host, checking for pingback.ping exposure, is skipped)")
+    parser.add_argument("--vhost-fuzz", action="store_true", help="Opt-in: fuzz for virtual hosts via ffuf (Host: header fuzzing against SecLists' Discovery/DNS wordlist), one apex per representative host. OFF by default — this is thousands of requests per apex, a much higher volume than anything else in this pipeline, and aggressive WAFs WILL rate-limit-block you over it (confirmed twice this session on two different targets from exactly this kind of under-throttled scanning). Respects --rate and --proxy.")
+    parser.add_argument("--dir-brute", action="store_true", help="Opt-in: recursive directory/file brute-force via feroxbuster (SecLists' Discovery/Web-Content/common.txt), per alive/in-scope host. OFF by default — same high-volume, rate-limit-block risk as --vhost-fuzz. Depth-limited to avoid unbounded recursion on a large site. Respects --rate and --proxy.")
 
     vuln_group = parser.add_argument_group(
         "vulnerability-class filter",
@@ -1346,10 +1810,14 @@ def main():
     outdir_target, target_label = determine_target_and_label(args.target, args.list_file)
 
     required_tools = ["gf", "nuclei", "httpx", "anew"]
-    if args.proxy:
-        required_tools.append("curl")  # only proxy_warmup() shells out to curl
+    if args.proxy or not args.no_cms_probe:
+        required_tools.append("curl")  # proxy_warmup() and check_wordpress_xmlrpc() both shell out to curl
     if not args.no_waf_detect:
         required_tools.append("wafw00f")
+    if args.vhost_fuzz:
+        required_tools.append("ffuf")
+    if args.dir_brute:
+        required_tools.append("feroxbuster")
     which_or_die(required_tools)
 
     outdir = resolve_outdir(outdir_target, args.indir)
@@ -1401,12 +1869,13 @@ def main():
     if ssrf_sink_hits:
         detail(f"{len(ssrf_sink_hits)} high-confidence SSRF sink(s) identified (known fetch-sink path shape) — see Quick Reference")
 
+    proxy_url = PROXY_ADDRESS if args.proxy else None
+
     phase("WAF/CDN DETECTION")
     if args.no_waf_detect:
         info("--no-waf-detect set — skipping wafw00f")
         waf_findings = []
     else:
-        proxy_url = PROXY_ADDRESS if args.proxy else None
         waf_findings = waf_detect(alive_path, triage_dir, proxy_url, args.headers)
         if waf_findings:
             for f in waf_findings:
@@ -1425,6 +1894,44 @@ def main():
             detail(f"{pf['host']}:{pf['port']} ({pf['service']}, {'confirmed' if pf['confirmed'] else 'unconfirmed'}) — {'/'.join(pf['candidate_classes'])}")
     else:
         success("No open-port/candidate overlap found")
+
+    phase("CMS FINGERPRINT")
+    cms_by_host = detect_cms_names(alive_path, triage_dir, args.headers)
+    for host, name in cms_by_host.items():
+        detail(f"{host}: {name}")
+    cms_versions = fingerprint_cms_versions(outdir / "recon" / "endpoints.txt", cms_by_host, proxy_url, args.headers)
+    for host, versions in cms_versions.items():
+        detail(f"{host}: " + ", ".join(f"{name} {ver}" for name, ver in versions.items()))
+    if args.no_cms_probe:
+        info("--no-cms-probe set — skipping xmlrpc.php live check")
+        xmlrpc_findings = []
+    else:
+        xmlrpc_findings = check_wordpress_xmlrpc(cms_by_host, proxy_url, args.headers)
+        for xf in xmlrpc_findings:
+            if xf["pingback_exposed"]:
+                warn(f"{xf['host']}: xmlrpc.php live, pingback.ping exposed — classic WordPress SSRF primitive, see Quick Reference")
+            else:
+                detail(f"{xf['host']}: xmlrpc.php live, pingback.ping not exposed")
+    if not cms_by_host:
+        success("No CMS detected")
+
+    vhost_hits = []
+    if args.vhost_fuzz:
+        phase("VHOST FUZZING")
+        vhost_hits = vhost_fuzz(alive_path, triage_dir, args.rate, proxy_url, args.headers)
+        if vhost_hits:
+            warn(f"{len(vhost_hits)} vhost(s) found not in DNS/crawl — see triage/vhosts_found.txt")
+        else:
+            success("No additional vhosts found")
+
+    dirbrute_hits = []
+    if args.dir_brute:
+        phase("DIRECTORY BRUTEFORCE")
+        dirbrute_hits = dir_brute(alive_path, triage_dir, args.rate, proxy_url, args.headers)
+        if dirbrute_hits:
+            warn(f"{len(dirbrute_hits)} path(s) found — see triage/dirbrute_findings.txt")
+        else:
+            success("No additional paths found")
 
     ext_live_count = check_interesting_ext_live(triage_dir, args.rate, args.headers)
     dangerous_count = 0
@@ -1532,7 +2039,8 @@ def main():
         prev_state is not None, new_findings, new_secrets, new_dangerous, new_manual,
         takeover_findings, cors_findings,
         terms, active_fuzz_classes + active_manual_classes, skipped_classes,
-        waf_findings, tech_by_host, port_findings, ssrf_sink_hits,
+        waf_findings, tech_by_host, port_findings, ssrf_sink_hits, cms_versions, xmlrpc_findings,
+        cms_by_host, vhost_hits, dirbrute_hits,
     )
     json_path = write_json_summary(
         triage_dir, target_label, url_count, gf_counts, ext_live_count, dangerous_count,
@@ -1548,6 +2056,26 @@ def main():
     print(f"{DIM}{'─' * 60}{RESET}")
     print(f"{CYAN}{BOLD}  TALON TRIAGE COMPLETE{RESET}\n")
     print(f"  {DIM}{'TARGET':<16}{RESET} {BOLD}{target_label}{RESET}")
+    if waf_findings:
+        waf_names = sorted({f.get("firewall", "Unknown") for f in waf_findings})
+        print(f"  {DIM}{'WAF/CDN':<16}{RESET} {BOLD}{', '.join(waf_names)}{RESET}")
+    else:
+        print(f"  {DIM}{'WAF/CDN':<16}{RESET} {BOLD}None detected{RESET}")
+    all_tech = sorted({t for techs in tech_by_host.values() for t in techs})
+    if all_tech:
+        print(f"  {DIM}{'TECH STACK':<16}{RESET} {BOLD}{', '.join(all_tech)}{RESET}")
+    if cms_by_host:
+        parts = []
+        for host in sorted(cms_by_host):
+            name = cms_by_host[host]
+            host_vers = cms_versions.get(host, {})
+            primary_ver = host_vers.get(name)
+            parts.append(f"{host}: {name}" + (f" {primary_ver}" if primary_ver else ""))
+        print(f"  {DIM}{'CMS/VERSIONS':<16}{RESET} {BOLD}{'; '.join(parts)}{RESET}")
+    if vhost_hits:
+        print(f"  {DIM}{'VHOSTS FOUND':<16}{RESET} {BOLD}{len(vhost_hits)}{RESET}")
+    if dirbrute_hits:
+        print(f"  {DIM}{'DIR BRUTE HITS':<16}{RESET} {BOLD}{len(dirbrute_hits)}{RESET}")
     print(f"  {DIM}{'URLS TRIAGED':<16}{RESET} {BOLD}{url_count}{RESET}")
     print(f"  {DIM}{'JS SECRETS':<16}{RESET} {BOLD}{len(secret_findings)}{RESET}")
     print(f"  {DIM}{'NUCLEI FINDINGS':<16}{RESET} {BOLD}{len(findings)}{RESET}")
