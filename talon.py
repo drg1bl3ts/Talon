@@ -168,6 +168,83 @@ PORT_SERVICE_MAP = {
     50070: {"service": "Hadoop NameNode", "ssrfmap": None},
 }
 
+# GF's ssrf pattern matches on PARAM NAME alone (url=, redirect=, callback=,
+# ...), which is why ssrf_candidates.txt runs into the hundreds while the
+# real fetch-sinks in it are usually a small handful — a client-side SPA
+# routing param and a server-side fetch endpoint can share the exact same
+# param name. These patterns match on PATH instead (what actually decides
+# whether the server makes a network call, not what the value is called),
+# formalizing the manual triage done by hand across every target this
+# session rather than re-deriving it per target:
+#   - wp-json/oembed, _next/image, ext_redirect/exit(out).asp are CONFIRMED
+#     real server-side fetch mechanisms (WordPress core, Next.js image
+#     optimizer, legacy .gov/.mil exit-interstitial handlers respectively) —
+#     verified hands-on this session, not just documented elsewhere.
+#   - The rest are well-documented real-world SSRF sink classes (WordPress
+#     VIP/Jetpack REST routes, SSO/SAML federation callbacks, webhook
+#     registration, link-unfurl/preview, PDF/document/screenshot renderers,
+#     generic proxy/fetch utility endpoints) — principled inclusions from
+#     general SSRF methodology, not yet hands-on-confirmed on a specific
+#     target the way the first group is.
+# This is a triage accelerator, not a replacement for reviewing what it
+# excludes — a genuinely novel sink shape won't match anything here and
+# will only ever show up in the raw ssrf_candidates.txt count.
+KNOWN_SSRF_SINK_PATTERNS = [re.compile(p, re.IGNORECASE) for p in (
+    r"wp-json/oembed",
+    r"wp-json/jetpack",
+    r"_next/image",
+    r"ext_redirect",
+    r"exit(out)?\.asp",
+    r"/(saml|oidc|sso)/",
+    r"\bacs\b",
+    r"webhook",
+    r"unfurl",
+    r"link[-_]?preview",
+    r"\bscreenshot\b",
+    r"\bthumbnail\b",
+    r"/(render|pdf|export)\b",
+    r"\b(proxy|fetch)\.(php|asp|aspx|jsp)",
+)]
+
+
+def classify_ssrf_sinks(triage_dir: Path, alive_path: Path) -> list[str]:
+    """Cross-references ssrf_candidates.txt against KNOWN_SSRF_SINK_PATTERNS
+    (real fetch-sink shape, not just param name) and the confirmed-alive/
+    in-scope host list (kills Wayback/ParamSpider-only entries for hosts
+    that were never actually live — the digital.va.gov situation from this
+    session's VA.gov work), then dedupes by _param_signature() the same way
+    nuclei's own fuzz-target dedup does, so ten copies of the same endpoint
+    with different literal query values collapse to the one representative
+    worth actually testing. Returns the deduped, high-confidence hit list —
+    empty if ssrf_candidates.txt doesn't exist or nothing matches."""
+    candidates_path = triage_dir / "ssrf_candidates.txt"
+    if not candidates_path.exists():
+        return []
+    alive_hosts = set()
+    if alive_path.exists():
+        alive_hosts = {line_hostname(l) for l in alive_path.read_text(errors="ignore").splitlines() if l.strip()}
+    by_signature: dict[tuple, str] = {}
+    for line in candidates_path.read_text(errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if alive_hosts and line_hostname(line) not in alive_hosts:
+            continue
+        path = urlparse(line).path
+        if not any(pat.search(path) for pat in KNOWN_SSRF_SINK_PATTERNS):
+            continue
+        sig = _param_signature(line)
+        current = by_signature.get(sig)
+        # Prefer a representative with a real captured value over a bare
+        # ParamSpider FUZZ placeholder — "url=FUZZ" isn't directly testable
+        # (the exact mistake made by hand earlier this session, handing over
+        # a blank param and getting a 404 back). Only keep FUZZ if it's the
+        # only variant this signature ever appears with.
+        if current is None or ("FUZZ" in current and "FUZZ" not in line):
+            by_signature[sig] = line
+    return sorted(by_signature.values())
+
+
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # tech_domains lines (httpx --status-code --title --server -tech-detect -cl)
 # look like: https://host [<status>] [<len>] [<title>] [<server>] [<tech,tech>]
@@ -907,6 +984,7 @@ def severity_breakdown(findings) -> dict:
 
 def _quick_reference_section(
     triage_dir: Path, gf_counts: dict, waf_findings: list, tech_by_host: dict, port_findings: list,
+    ssrf_sink_hits: list | None = None,
 ) -> list[str]:
     """The consolidated top-of-report block: WAF/CDN, tech stack, ports of
     interest, and SSRF signal-vs-noise — the exact manual cross-referencing
@@ -945,7 +1023,12 @@ def _quick_reference_section(
 
     ssrf_raw = gf_counts.get("ssrf", 0)
     ssrf_nuclei = count_lines(triage_dir / "nuclei" / "nuclei_ssrf.jsonl")
-    lines.append(f"**SSRF candidates:** {ssrf_raw} raw match(es), {ssrf_nuclei} nuclei-flagged — the rest need manual source→sink verification before trusting them (see the SSRF workflow note: GF pattern matches include plenty of client-side-only redirect/routing params, not real server-side fetchers)")
+    ssrf_sink_hits = ssrf_sink_hits or []
+    lines.append(f"**SSRF candidates:** {ssrf_raw} raw match(es), {ssrf_nuclei} nuclei-flagged, {len(ssrf_sink_hits)} high-confidence sink(s) — the rest need manual source→sink verification before trusting them (see the SSRF workflow note: GF pattern matches include plenty of client-side-only redirect/routing params, not real server-side fetchers)")
+    if ssrf_sink_hits:
+        lines.append("\nHigh-confidence sinks (known fetch-sink path shape, deduped, alive/in-scope only — test these first):")
+        for hit in ssrf_sink_hits:
+            lines.append(f"- `{hit}`")
 
     rec_bullets = []
     for f in waf_findings:
@@ -981,6 +1064,7 @@ def write_recommendations_md(
     takeover_findings: list, cors_findings: list,
     terms: dict, classes: list, skipped_classes: list[str],
     waf_findings: list | None = None, tech_by_host: dict | None = None, port_findings: list | None = None,
+    ssrf_sink_hits: list | None = None,
 ) -> Path:
     sev = severity_breakdown(findings)
     lines = []
@@ -992,7 +1076,7 @@ def write_recommendations_md(
         lines.append(f"> Vulnerability-class filter active — skipped this run: {', '.join(skipped_classes)}\n")
 
     lines.extend(_quick_reference_section(
-        triage_dir, gf_counts, waf_findings or [], tech_by_host or {}, port_findings or [],
+        triage_dir, gf_counts, waf_findings or [], tech_by_host or {}, port_findings or [], ssrf_sink_hits or [],
     ))
 
     if has_prev_run:
@@ -1313,6 +1397,10 @@ def main():
     for cls in scanned_classes:
         detail(f"{cls['slug']}: {gf_counts[cls['slug']]}")
 
+    ssrf_sink_hits = classify_ssrf_sinks(triage_dir, alive_path)
+    if ssrf_sink_hits:
+        detail(f"{len(ssrf_sink_hits)} high-confidence SSRF sink(s) identified (known fetch-sink path shape) — see Quick Reference")
+
     phase("WAF/CDN DETECTION")
     if args.no_waf_detect:
         info("--no-waf-detect set — skipping wafw00f")
@@ -1444,7 +1532,7 @@ def main():
         prev_state is not None, new_findings, new_secrets, new_dangerous, new_manual,
         takeover_findings, cors_findings,
         terms, active_fuzz_classes + active_manual_classes, skipped_classes,
-        waf_findings, tech_by_host, port_findings,
+        waf_findings, tech_by_host, port_findings, ssrf_sink_hits,
     )
     json_path = write_json_summary(
         triage_dir, target_label, url_count, gf_counts, ext_live_count, dangerous_count,
