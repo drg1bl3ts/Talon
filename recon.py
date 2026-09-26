@@ -13,15 +13,17 @@ Talon owns the whole pipeline end to end, calling the underlying tools
 subfaster, waymore, paramspider) directly — there is no wrapping layer
 and no separate external recon process involved.
 
-Output layout matches what talon.py's triage stage expects:
+Output layout matches what talon.py's triage stage expects — every target
+directory is exactly three subfolders, nothing loose at the root:
 
-    <outdir>/subs.txt
-    <outdir>/fresh_alive_domains
-    <outdir>/resolved_dns
-    <outdir>/tech_domains
-    <outdir>/naabu.txt
-    <outdir>/endpoints.txt
+    <outdir>/recon/subs.txt
+    <outdir>/recon/fresh_alive_domains
+    <outdir>/recon/resolved_dns
+    <outdir>/recon/tech_domains
+    <outdir>/recon/naabu.txt
+    <outdir>/recon/endpoints.txt
     <outdir>/params/all.txt
+    <outdir>/triage/...
 
 Only scan assets you are authorised to test.
 """
@@ -90,7 +92,11 @@ def load_targets(target: str | None, list_file: str | None) -> tuple[list[str], 
         raise ValueError(f"List file is empty: {list_file}")
 
     if path.suffix.lower() == ".csv":
-        candidates = parse_scope_csv(path)
+        # parse_scope_csv() now returns (hostname, is_wildcard) pairs — the
+        # wildcard flag matters for --scope-file's final authorized-to-test
+        # filtering (talon.py), but load_targets() just needs domains to
+        # run recon AGAINST, so unwrap back to bare hostnames here.
+        candidates = [hostname for hostname, _ in parse_scope_csv(path)]
     else:
         candidates = []
         for raw in path.read_text(errors="ignore").splitlines():
@@ -264,7 +270,7 @@ def discover_subdomains(targets: list[str], targets_file: Path, outdir: Path) ->
     cleaned = {s.strip().lower().rstrip(".") for s in subs if s.strip()}
     scoped = sorted(s for s in cleaned if in_scope(s, targets))
 
-    subs_path = outdir / "subs.txt"
+    subs_path = outdir / "recon" / "subs.txt"
     subs_path.write_text("\n".join(scoped) + ("\n" if scoped else ""))
 
     success("SUBDOMAIN DISCOVERY COMPLETE")
@@ -278,13 +284,13 @@ def discover_subdomains(targets: list[str], targets_file: Path, outdir: Path) ->
 
 def alive_check(subs_path: Path, outdir: Path, headers: list[str] | None = None, rate: int = 50) -> Path:
     phase("ALIVE HOST DETECTION")
-    alive_path = outdir / "fresh_alive_domains"
+    alive_path = outdir / "recon" / "fresh_alive_domains"
     alive_path.touch()
     run_piped_to_anew_paced(
         ["httpx", "-l", str(subs_path), "-silent", "-threads", "200", "-rate-limit", str(rate)] + header_args(headers),
         alive_path, "httpx:alive", total=count_lines(subs_path), rate=rate,
     )
-    tech_path = outdir / "tech_domains"
+    tech_path = outdir / "recon" / "tech_domains"
     run_to_file(
         [
             "httpx", "-l", str(alive_path), "--status-code",
@@ -300,7 +306,7 @@ def alive_check(subs_path: Path, outdir: Path, headers: list[str] | None = None,
 
 def dns_enumeration(alive_path: Path, outdir: Path) -> Path:
     phase("DNS ENUMERATION")
-    resolved_path = outdir / "resolved_dns"
+    resolved_path = outdir / "recon" / "resolved_dns"
     run_to_file(
         ["dnsx", "-l", str(alive_path), "-threads", "300", "-silent"],
         resolved_path, "dnsx", total=count_lines(alive_path),
@@ -320,7 +326,7 @@ def port_discovery(resolved_path: Path, outdir: Path, rate: int = 50) -> Path:
     handing it to run_to_file_paced() — same math, just re-based to match
     naabu.txt's real unit (one line per open PORT found, not per host)."""
     phase("PORT DISCOVERY")
-    naabu_path = outdir / "naabu.txt"
+    naabu_path = outdir / "recon" / "naabu.txt"
     total_hosts = count_lines(resolved_path)
     ports_per_host = 100
     hosts_per_sec = (rate / ports_per_host) if rate else 0
@@ -386,7 +392,7 @@ def crawl_and_collect_urls(targets: list[str], outdir: Path, tmpdir: Path, heade
             if line and in_scope(_url_host(line), targets):
                 merged.add(line)
 
-    endpoints_path = outdir / "endpoints.txt"
+    endpoints_path = outdir / "recon" / "endpoints.txt"
     endpoints_path.write_text("\n".join(sorted(merged)) + ("\n" if merged else ""))
 
     count = len(merged)
@@ -491,6 +497,7 @@ def run_full_recon(target: str | None, list_file: str | None, outdir: Path,
 
     outdir.mkdir(parents=True, exist_ok=True)
     outdir = outdir.resolve()
+    (outdir / "recon").mkdir(parents=True, exist_ok=True)
     tmpdir = Path(tempfile.mkdtemp(prefix="talon-recon-"))
 
     try:

@@ -12,9 +12,13 @@ picks up from there: buckets the resulting endpoints/params into
 vuln-class candidates with gf, scans those candidates and every live
 host with nuclei (including a dedicated CORS pass and a
 subdomain-takeover pass), fetches JS files to check for hardcoded
-secrets, diffs this run against the last one against the same target,
-and writes out a recommendations report scoped for manual follow-up in
-Caido or Burp Suite (--proxy).
+secrets, fingerprints WAF/CDN vendor with wafw00f, labels and
+cross-references naabu's discovered ports against every vuln-class
+candidate (nuclei-confirmed, not just guessed by port number), diffs
+this run against the last one against the same target, and writes out
+a recommendations report — leading with a Quick Reference summary
+(WAF, tech stack, ports of interest, SSRF signal-vs-noise) — scoped
+for manual follow-up in Caido or Burp Suite (--proxy).
 
 Usage:
     talon.py -t example.com
@@ -49,7 +53,7 @@ from talon_common import (
     RESET, BOLD, DIM, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN,
     log, ts, info, phase, success, warn, error, detail, die,
     which_or_die, run, count_lines, Progress, run_with_spinner, run_to_file,
-    run_to_file_paced, pipe_to_anew, header_args, parse_scope_csv,
+    run_to_file_paced, pipe_to_anew, header_args, resolved_headers, parse_scope_csv,
 )
 
 # --- Only scan assets you are authorised to test. ---
@@ -132,6 +136,73 @@ SECRET_PATTERNS = [
     ("private_key_block", r"-----BEGIN (?:RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----"),
 ]
 SECRET_PATTERN_NAMES = {pattern: name for name, pattern in SECRET_PATTERNS}
+
+# Same port -> service/module mapping as the SSRFmap "finding -> next module"
+# quick reference in the SSRF Obsidian note — this is the static, free first
+# pass naabu.txt gets labeled with before anything spends a live request
+# confirming it. `ssrfmap` is the suggested module name for RECOMMENDATIONS.md
+# wording; None means "worth knowing about, but not an SSRFmap pivot."
+PORT_SERVICE_MAP = {
+    21: {"service": "FTP", "ssrfmap": None},
+    22: {"service": "SSH", "ssrfmap": None},
+    23: {"service": "Telnet", "ssrfmap": None},
+    25: {"service": "SMTP", "ssrfmap": "smtp"},
+    445: {"service": "SMB", "ssrfmap": "smbhash"},
+    1433: {"service": "MSSQL", "ssrfmap": None},
+    2181: {"service": "Zookeeper", "ssrfmap": None},
+    2375: {"service": "Docker API (unencrypted)", "ssrfmap": "docker"},
+    2376: {"service": "Docker API (TLS)", "ssrfmap": "docker"},
+    3306: {"service": "MySQL", "ssrfmap": "mysql"},
+    3389: {"service": "RDP", "ssrfmap": None},
+    5432: {"service": "PostgreSQL", "ssrfmap": "postgres"},
+    5900: {"service": "VNC", "ssrfmap": None},
+    5984: {"service": "CouchDB", "ssrfmap": None},
+    6379: {"service": "Redis", "ssrfmap": "redis"},
+    8080: {"service": "HTTP-alt / Tomcat Manager", "ssrfmap": "tomcat"},
+    8500: {"service": "Consul agent API", "ssrfmap": "consul"},
+    9000: {"service": "FastCGI/php-fpm", "ssrfmap": "fastcgi"},
+    9200: {"service": "Elasticsearch", "ssrfmap": None},
+    11211: {"service": "Memcached", "ssrfmap": "memcache"},
+    15672: {"service": "RabbitMQ management", "ssrfmap": None},
+    27017: {"service": "MongoDB", "ssrfmap": None},
+    50070: {"service": "Hadoop NameNode", "ssrfmap": None},
+}
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# tech_domains lines (httpx --status-code --title --server -tech-detect -cl)
+# look like: https://host [<status>] [<len>] [<title>] [<server>] [<tech,tech>]
+# — 5 bracket groups, ANSI-colored, tech list only present when detected.
+_TECH_LINE_RE = re.compile(r"^(\S+)\s+\[(\d*)\]\s+\[(\d*)\]\s+\[([^\]]*)\]\s+\[([^\]]*)\](?:\s+\[([^\]]*)\])?")
+
+
+def _strip_ansi(s: str) -> str:
+    return _ANSI_RE.sub("", s)
+
+
+def parse_tech_domains(tech_path: Path) -> dict[str, list[str]]:
+    """Parses recon.py's tech_domains into {host: [tech, tech, ...]} — the
+    same fingerprint data manually cross-referenced against SSRF candidates
+    all session (cloud provider before picking an SSRFmap cloud module,
+    CDN/WAF name before picking a bypass strategy). Missing/malformed lines
+    are skipped rather than raising — this is best-effort context for the
+    Quick Reference section, not something worth failing the whole report
+    over if httpx's output format drifts."""
+    result: dict[str, list[str]] = {}
+    if not tech_path.exists():
+        return result
+    for raw in tech_path.read_text(errors="ignore").splitlines():
+        line = _strip_ansi(raw).strip()
+        if not line:
+            continue
+        m = _TECH_LINE_RE.match(line)
+        if not m:
+            continue
+        url, tech_group = m.group(1), m.group(6)
+        host = urlparse(url).hostname or url
+        techs = [t.strip() for t in (tech_group or "").split(",") if t.strip()]
+        if techs:
+            result[host.lower()] = techs
+    return result
 
 # The warm-up itself is just `curl -x <proxy>` — mechanically identical for
 # Caido and Burp Suite, and both default to listening on this same address,
@@ -254,7 +325,15 @@ def require_file(path: Path, hint: str):
         die(f"Expected recon output missing: {path}\n           {hint}")
 
 
-def load_scope(scope_file: Path) -> list[str]:
+def load_scope(scope_file: Path) -> list[tuple[str, bool]]:
+    """Returns (hostname, is_wildcard) pairs — see parse_scope_csv()'s
+    docstring for why the wildcard flag matters. A plain-text scope file
+    (not a HackerOne CSV) has no asset_type column to read, so every line
+    is treated as wildcard=True — the same permissive suffix-matching
+    behavior this function always had. That's a deliberate, narrower fix
+    than it might look: only CSV rows explicitly typed URL (not WILDCARD)
+    get the new exact-host-only enforcement, because only the CSV actually
+    carries the signal needed to enforce it correctly."""
     if not scope_file.exists():
         die(f"--scope-file not found: {scope_file}")
     if scope_file.suffix.lower() == ".csv":
@@ -264,7 +343,7 @@ def load_scope(scope_file: Path) -> list[str]:
         line = line.strip().lower()
         if not line or line.startswith("#"):
             continue
-        domains.append(line.lstrip("*.").lstrip("."))
+        domains.append((line.lstrip("*.").lstrip("."), True))
     return sorted(set(domains))
 
 
@@ -280,11 +359,14 @@ def line_hostname(line: str) -> str:
     return host.lower()
 
 
-def in_scope(host: str, scope_domains: list[str]) -> bool:
-    return any(host == d or host.endswith("." + d) for d in scope_domains)
+def in_scope(host: str, scope_domains: list[tuple[str, bool]]) -> bool:
+    """host == d always matches (the exact listed asset). host is only a
+    matching SUBdomain when that scope entry is wildcard=True — a bare
+    URL-type CSV row (wildcard=False) authorizes just that one host."""
+    return any(host == d or (wildcard and host.endswith("." + d)) for d, wildcard in scope_domains)
 
 
-def filter_by_scope(src: Path, dst: Path, scope_domains: list[str]) -> tuple[Path, int, int]:
+def filter_by_scope(src: Path, dst: Path, scope_domains: list[tuple[str, bool]]) -> tuple[Path, int, int]:
     if not src.exists():
         dst.touch()
         return dst, 0, 0
@@ -301,7 +383,7 @@ def filter_by_scope(src: Path, dst: Path, scope_domains: list[str]) -> tuple[Pat
 
 
 def build_all_urls(outdir: Path, triage_dir: Path) -> tuple[Path, int]:
-    endpoints = outdir / "endpoints.txt"
+    endpoints = outdir / "recon" / "endpoints.txt"
     require_file(
         endpoints,
         "This needs a full recon run (endpoints.txt is only written by recon.py's "
@@ -502,6 +584,167 @@ def nuclei_takeover_scan(alive: Path, nuclei_dir: Path, rate: int, headers: list
     return out if out.exists() else None
 
 
+def _apex_group(host: str) -> str:
+    """Last two dot-separated labels as a stand-in for "registrable domain"
+    — good enough to dedupe a target list down to one representative host
+    per apex before wafw00f runs, without pulling in a public-suffix-list
+    dependency. Under-merges multi-label TLDs (co.uk, com.au, ...) into
+    separate apex groups instead of one — acceptable here since the failure
+    mode is "wafw00f runs on one extra host," not a correctness bug, and
+    Talon has no psl dependency anywhere else in the codebase."""
+    parts = host.strip(".").split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+
+def waf_detect(alive_path: Path, triage_dir: Path, proxy: str | None, headers: list[str] | None,
+                timeout: int = 15) -> list[dict]:
+    """Runs wafw00f against one representative host per apex domain (NOT
+    every subdomain in fresh_alive_domains) — this is the actual throttle:
+    wafw00f has no -rate-limit of its own (only -T timeout), so the request
+    volume this pass generates is bounded by keeping the target COUNT low
+    rather than pacing requests within a single call. A small sleep between
+    each apex's call on top of that, same spirit as proxy_warmup()'s pacing,
+    for the (rare) many-apex --list run.
+
+    -a (--findall) so a genuinely mixed-vendor setup (confirmed for real
+    this session — one program had AWS ELB WAF on its root path and F5
+    BIG-IP ASM on a legacy subpath) gets reported as both, not just the
+    first match wafw00f happens to hit.
+
+    Returns a list of {"url", "detected", "firewall", "manufacturer"} dicts
+    (wafw00f's own JSON schema, confirmed from
+    /usr/lib/python3.*/site-packages/wafw00f/main.py) — only entries with
+    detected=True are kept, since "no WAF" isn't something the Quick
+    Reference section needs to enumerate per host."""
+    if not alive_path.exists():
+        return []
+    hosts_by_apex: dict[str, str] = {}
+    for line in alive_path.read_text(errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        host = line_hostname(line)
+        if not host:
+            continue
+        hosts_by_apex.setdefault(_apex_group(host), line)
+    targets = sorted(hosts_by_apex.values())
+    if not targets:
+        return []
+
+    headers_file = triage_dir / ".wafw00f_headers.tmp"
+    headers_file.write_text("\n".join(resolved_headers(headers)) + "\n")
+
+    results: list[dict] = []
+    progress = Progress("wafw00f:detect")
+    for i, url in enumerate(targets, 1):
+        progress.update(f"{i}/{len(targets)} apex host(s)", percent=100 * (i - 1) / len(targets))
+        cmd = ["wafw00f", url, "-a", "-f", "json", "-o", "-", "-H", str(headers_file), "-T", str(timeout)]
+        if proxy:
+            cmd += ["-p", proxy]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout + 10)
+        except subprocess.TimeoutExpired:
+            warn(f"wafw00f timed out against {url}")
+            continue
+        try:
+            parsed = json.loads(proc.stdout) if proc.stdout.strip() else []
+        except json.JSONDecodeError:
+            parsed = []
+        for entry in parsed if isinstance(parsed, list) else [parsed]:
+            if entry.get("detected"):
+                results.append(entry)
+        if i < len(targets):
+            time.sleep(1)
+    progress.stop(f"{GREEN}[{ts()}] ✓{RESET} wafw00f:detect complete — {len(results)} WAF/CDN hit(s) across {len(targets)} apex host(s)")
+
+    headers_file.unlink(missing_ok=True)
+    out = triage_dir / "waf_detect.json"
+    out.write_text(json.dumps(results, indent=2))
+    return results
+
+
+def naabu_service_triage(outdir: Path, triage_dir: Path, nuclei_dir: Path, rate: int,
+                          headers: list[str] | None, candidate_classes: list, skip_confirm: bool) -> list[dict]:
+    """Labels naabu.txt (currently write-only — recon.py writes it, nothing
+    ever reads it back) against PORT_SERVICE_MAP, optionally confirms the
+    interesting ones with nuclei's network-protocol templates (reuses
+    Talon's existing nuclei/rate-limit/progress machinery — no new nmap
+    dependency), then cross-references against every vuln-class candidate
+    file so a host that's BOTH "has an SSRF-shaped param" AND "has an
+    unconfirmed Redis port open" surfaces as one entry instead of two
+    disconnected facts in two different files a human has to remember to
+    cross-check by hand.
+
+    Returns a list of {"host", "port", "service", "ssrfmap", "confirmed",
+    "candidate_classes"} dicts, already filtered to hosts that appear in at
+    least one candidate file — naabu.txt entries with no matching candidate
+    are still useful context but aren't worth a Quick Reference line each."""
+    naabu_path = outdir / "recon" / "naabu.txt"
+    if not naabu_path.exists():
+        return []
+
+    labeled: list[tuple[str, int, dict]] = []
+    for line in naabu_path.read_text(errors="ignore").splitlines():
+        line = line.strip()
+        if ":" not in line:
+            continue
+        host, _, port_s = line.rpartition(":")
+        if not host or not port_s.isdigit():
+            continue
+        port = int(port_s)
+        info_ = PORT_SERVICE_MAP.get(port)
+        if info_:
+            labeled.append((host.lower(), port, info_))
+
+    if not labeled:
+        return []
+
+    confirmed_hosts: set[str] = set()
+    if not skip_confirm:
+        interesting_file = triage_dir / ".naabu_interesting.tmp"
+        interesting_file.write_text("\n".join(f"{h}:{p}" for h, p, _ in labeled) + "\n")
+        out = nuclei_dir / "nuclei_network.jsonl"
+        cmd = [
+            "nuclei", "-silent", "-l", str(interesting_file), "-pt", "tcp",
+            "-tags", "network,exposed-panels", "-etags", "dos",
+            "-rate-limit", str(rate), "-jsonl", "-o", str(out),
+        ] + header_args(headers) + NUCLEI_STATS_FLAGS
+        returncode = run_nuclei_with_progress(cmd, "nuclei:network")
+        if returncode != 0:
+            warn(f"nuclei network-confirmation pass exited {returncode}")
+        for f in parse_nuclei_jsonl([out] if out.exists() else []):
+            matched = f.get("matched_at") or ""
+            confirmed_hosts.add(line_hostname(matched))
+        interesting_file.unlink(missing_ok=True)
+
+    # Which hosts have a candidate in ANY scanned vuln class — same
+    # host-extraction helper the scope filter already uses, so a URL like
+    # http://api.target.com/oembed?url=... and a naabu hit for
+    # api.target.com:6379 correctly match on host despite one being a URL
+    # and the other a bare host:port.
+    candidate_hosts: dict[str, set[str]] = {}
+    for cls in candidate_classes:
+        p = triage_dir / f"{cls['slug']}_candidates.txt"
+        if not p.exists():
+            continue
+        for line in p.read_text(errors="ignore").splitlines():
+            h = line_hostname(line)
+            if h:
+                candidate_hosts.setdefault(h, set()).add(cls["slug"])
+
+    results = []
+    for host, port, info_ in labeled:
+        classes_here = candidate_hosts.get(host)
+        if not classes_here:
+            continue
+        results.append({
+            "host": host, "port": port, "service": info_["service"],
+            "ssrfmap": info_["ssrfmap"], "confirmed": host in confirmed_hosts,
+            "candidate_classes": sorted(classes_here),
+        })
+    return results
+
+
 def _param_signature(url: str) -> tuple:
     """Host+path plus the sorted set of query-parameter NAMES (values
     dropped) — the actual injection point nuclei's fuzzing templates test.
@@ -662,6 +905,74 @@ def severity_breakdown(findings) -> dict:
     return counts
 
 
+def _quick_reference_section(
+    triage_dir: Path, gf_counts: dict, waf_findings: list, tech_by_host: dict, port_findings: list,
+) -> list[str]:
+    """The consolidated top-of-report block: WAF/CDN, tech stack, ports of
+    interest, and SSRF signal-vs-noise — the exact manual cross-referencing
+    (tech_domains for cloud provider before an SSRFmap cloud module,
+    naabu.txt for interesting ports, ssrf_candidates.txt for real fetch
+    sinks) done by hand every time, now generated once per run instead."""
+    lines = ["## Quick Reference"]
+
+    if waf_findings:
+        seen = {}
+        for f in waf_findings:
+            key = (f.get("firewall") or "Unknown", f.get("manufacturer") or "")
+            seen.setdefault(key, f.get("url", ""))
+        waf_str = "; ".join(
+            f"{fw}" + (f" ({mfr})" if mfr and mfr not in ("Unknown", "None", fw) else "") + f" — {url}"
+            for (fw, mfr), url in seen.items()
+        )
+        lines.append(f"**WAF/CDN:** {waf_str}")
+    else:
+        lines.append("**WAF/CDN:** None detected (or wafw00f skipped/found nothing — see `triage/waf_detect.json`)")
+
+    all_tech = sorted({t for techs in tech_by_host.values() for t in techs})
+    lines.append(f"**Tech stack:** {', '.join(all_tech) if all_tech else 'None fingerprinted'}")
+
+    if port_findings:
+        lines.append("**Ports of interest:**")
+        for pf in port_findings:
+            tag = "confirmed" if pf["confirmed"] else "unconfirmed"
+            module_note = f", suggested `ssrfmap -m {pf['ssrfmap']}`" if pf["ssrfmap"] else ""
+            lines.append(
+                f"- `{pf['host']}:{pf['port']}` — {pf['service']} ({tag}) — "
+                f"also has {'/'.join(pf['candidate_classes'])} candidate(s) on this host{module_note}"
+            )
+    else:
+        lines.append("**Ports of interest:** None — no naabu-discovered port on a host that also has a vuln candidate")
+
+    ssrf_raw = gf_counts.get("ssrf", 0)
+    ssrf_nuclei = count_lines(triage_dir / "nuclei" / "nuclei_ssrf.jsonl")
+    lines.append(f"**SSRF candidates:** {ssrf_raw} raw match(es), {ssrf_nuclei} nuclei-flagged — the rest need manual source→sink verification before trusting them (see the SSRF workflow note: GF pattern matches include plenty of client-side-only redirect/routing params, not real server-side fetchers)")
+
+    rec_bullets = []
+    for f in waf_findings:
+        fw = f.get("firewall", "the detected WAF")
+        rec_bullets.append(
+            f"- WAF detected ({fw}) — expect signature/metacharacter-level filtering rather than a simple "
+            f"keyword blocklist. Bisect single characters before spraying full payloads, and keep `--rate` low; "
+            f"see `bypass-techniques` skill for vendor-specific escalation."
+        )
+        break  # one general-purpose bullet is enough even with multiple WAF hits
+    for pf in port_findings:
+        if pf["ssrfmap"]:
+            tag = "confirmed" if pf["confirmed"] else "unconfirmed"
+            already_note = " (already nuclei-confirmed — this step is just double-checking the SSRF path itself)" if pf["confirmed"] else ""
+            rec_bullets.append(
+                f"- `{pf['host']}:{pf['port']}` has an SSRF candidate AND {tag} {pf['service']} — "
+                f"confirm with QuickSSRF/interactsh first{already_note}, "
+                f"then `ssrfmap -r <request> -p <param> -m {pf['ssrfmap']}` if confirmed."
+            )
+    if rec_bullets:
+        lines.append("\n### Recommendations")
+        lines.extend(rec_bullets)
+
+    lines.append("")
+    return lines
+
+
 def write_recommendations_md(
     triage_dir: Path, target: str, url_count: int, gf_counts: dict,
     ext_live_count: int, dangerous_count: int, js_count: int, secret_findings: list,
@@ -669,6 +980,7 @@ def write_recommendations_md(
     has_prev_run: bool, new_findings: list, new_secrets: list, new_dangerous: list, new_manual: list,
     takeover_findings: list, cors_findings: list,
     terms: dict, classes: list, skipped_classes: list[str],
+    waf_findings: list | None = None, tech_by_host: dict | None = None, port_findings: list | None = None,
 ) -> Path:
     sev = severity_breakdown(findings)
     lines = []
@@ -678,6 +990,10 @@ def write_recommendations_md(
 
     if skipped_classes:
         lines.append(f"> Vulnerability-class filter active — skipped this run: {', '.join(skipped_classes)}\n")
+
+    lines.extend(_quick_reference_section(
+        triage_dir, gf_counts, waf_findings or [], tech_by_host or {}, port_findings or [],
+    ))
 
     if has_prev_run:
         total_new = len(new_findings) + len(new_secrets) + len(new_dangerous) + len(new_manual)
@@ -869,6 +1185,7 @@ def main():
             "  talon.py -t example.com --skip-recon\n"
             "  talon.py -t example.com --scope-file scope.txt\n"
             "  talon.py -t example.com --no-host-scan   # skip the slow all-host CVE sweep\n"
+            "  talon.py -t example.com --no-waf-detect --no-port-triage   # skip wafw00f + nuclei port confirmation\n"
             "  talon.py -t example.com --proxy caido   # warm up Caido's Sitemap with the manual queue\n"
             "  talon.py -t example.com --proxy burp   # same, worded for Burp Suite instead\n"
             "  talon.py -t example.com --ssrf --lfi   # only triage these vuln classes\n"
@@ -901,6 +1218,8 @@ def main():
     parser.add_argument("--no-js-scan", action="store_true", help="Skip fetching JS files and scanning them for hardcoded secrets")
     parser.add_argument("--no-host-scan", action="store_true", help="Skip the all-host severity:critical CVE/misconfig sweep (the slow one — ~1,870 templates x every alive host). CORS, takeover, and per-class fuzzing passes still run.")
     parser.add_argument("--max-candidates", type=int, default=None, help="Cap each fuzz class's deduped candidate list to this many (random sample) before nuclei scans it — bounds worst-case runtime against a URL-rich target instead of scanning every unique injection point found. Default: unlimited.")
+    parser.add_argument("--no-waf-detect", action="store_true", help="Skip the wafw00f WAF/CDN detection pass (one representative host per apex domain, ~2 requests each — fast, but skippable if wafw00f isn't installed or you already know the WAF)")
+    parser.add_argument("--no-port-triage", action="store_true", help="Skip the nuclei network-protocol confirmation pass for naabu-discovered ports (the static port->service labeling and Quick Reference cross-referencing still run — only the extra nuclei -pt tcp scan is skipped)")
 
     vuln_group = parser.add_argument_group(
         "vulnerability-class filter",
@@ -945,6 +1264,8 @@ def main():
     required_tools = ["gf", "nuclei", "httpx", "anew"]
     if args.proxy:
         required_tools.append("curl")  # only proxy_warmup() shells out to curl
+    if not args.no_waf_detect:
+        required_tools.append("wafw00f")
     which_or_die(required_tools)
 
     outdir = resolve_outdir(outdir_target, args.indir)
@@ -963,14 +1284,14 @@ def main():
     nuclei_dir.mkdir(parents=True, exist_ok=True)
 
     scope_domains = None
-    alive_path = outdir / "fresh_alive_domains"
+    alive_path = outdir / "recon" / "fresh_alive_domains"
     if args.scope_file:
         phase("SCOPE FILTER")
         scope_domains = load_scope(Path(args.scope_file))
         success(f"{len(scope_domains)} in-scope domain(s) loaded from {args.scope_file}")
 
         alive_path, kept, dropped = filter_by_scope(
-            outdir / "fresh_alive_domains", triage_dir / "fresh_alive_domains.inscope", scope_domains
+            outdir / "recon" / "fresh_alive_domains", triage_dir / "fresh_alive_domains.inscope", scope_domains
         )
         if dropped:
             warn(f"{dropped} out-of-scope alive host(s) filtered out — {kept} remain")
@@ -991,6 +1312,31 @@ def main():
     success("GF triage complete")
     for cls in scanned_classes:
         detail(f"{cls['slug']}: {gf_counts[cls['slug']]}")
+
+    phase("WAF/CDN DETECTION")
+    if args.no_waf_detect:
+        info("--no-waf-detect set — skipping wafw00f")
+        waf_findings = []
+    else:
+        proxy_url = PROXY_ADDRESS if args.proxy else None
+        waf_findings = waf_detect(alive_path, triage_dir, proxy_url, args.headers)
+        if waf_findings:
+            for f in waf_findings:
+                detail(f"{f.get('firewall')} — {f.get('url')}")
+        else:
+            success("No WAF/CDN detected")
+
+    phase("PORT/SERVICE TRIAGE")
+    tech_by_host = parse_tech_domains(outdir / "recon" / "tech_domains")
+    port_findings = naabu_service_triage(
+        outdir, triage_dir, nuclei_dir, args.rate, args.headers, scanned_classes, args.no_port_triage,
+    )
+    if port_findings:
+        warn(f"{len(port_findings)} naabu-discovered port(s) overlap with a vuln candidate — see Quick Reference in RECOMMENDATIONS.md")
+        for pf in port_findings:
+            detail(f"{pf['host']}:{pf['port']} ({pf['service']}, {'confirmed' if pf['confirmed'] else 'unconfirmed'}) — {'/'.join(pf['candidate_classes'])}")
+    else:
+        success("No open-port/candidate overlap found")
 
     ext_live_count = check_interesting_ext_live(triage_dir, args.rate, args.headers)
     dangerous_count = 0
@@ -1098,6 +1444,7 @@ def main():
         prev_state is not None, new_findings, new_secrets, new_dangerous, new_manual,
         takeover_findings, cors_findings,
         terms, active_fuzz_classes + active_manual_classes, skipped_classes,
+        waf_findings, tech_by_host, port_findings,
     )
     json_path = write_json_summary(
         triage_dir, target_label, url_count, gf_counts, ext_live_count, dangerous_count,

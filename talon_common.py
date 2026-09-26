@@ -58,18 +58,24 @@ def die(msg, code=1):
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
 
-def header_args(headers: list[str] | None) -> list[str]:
-    """Expands a list of 'Name: Value' strings into repeated -H flags — the
-    format httpx, nuclei, katana, and curl all share for custom headers.
-    Always injects DEFAULT_USER_AGENT unless the caller already supplied
-    their own User-Agent (via --header), so every request Talon sends
-    presents as an ordinary browser by default instead of whatever each
-    tool's own default happens to be."""
+def resolved_headers(headers: list[str] | None) -> list[str]:
+    """The raw 'Name: Value' string list Talon actually sends, with
+    DEFAULT_USER_AGENT injected unless the caller already supplied their own
+    User-Agent — factored out of header_args() so callers that need the raw
+    list (e.g. writing a headers FILE for a tool like wafw00f that doesn't
+    take -H pairs) get the same UA-default behavior as every -H-based call
+    instead of reimplementing it."""
     headers = list(headers) if headers else []
     if not any(h.split(":", 1)[0].strip().lower() == "user-agent" for h in headers):
         headers = headers + [f"User-Agent: {DEFAULT_USER_AGENT}"]
+    return headers
+
+
+def header_args(headers: list[str] | None) -> list[str]:
+    """Expands resolved_headers() into repeated -H flags — the format httpx,
+    nuclei, katana, and curl all share for custom headers."""
     args = []
-    for h in headers:
+    for h in resolved_headers(headers):
         args += ["-H", h]
     return args
 
@@ -89,7 +95,7 @@ def _scope_csv_hostname(identifier: str) -> str:
 SCOPE_CSV_WEB_ASSET_TYPES = {"URL", "WILDCARD"}
 
 
-def parse_scope_csv(csv_path: Path) -> list[str]:
+def parse_scope_csv(csv_path: Path) -> list[tuple[str, bool]]:
     """Parses a HackerOne scope export (Program page -> Scope -> Download
     CSV): identifier,asset_type,instruction,eligible_for_bounty,
     eligible_for_submission,... Keeps only URL/WILDCARD rows marked
@@ -97,7 +103,19 @@ def parse_scope_csv(csv_path: Path) -> list[str]:
     exports omit the column entirely). Shared by --scope-file (talon.py)
     and -l/--list (recon.py) so both parse a raw H1 export identically —
     pass the same CSV to both flags instead of hand-building a domain
-    list."""
+    list.
+
+    Returns (hostname, is_wildcard) pairs, not bare hostnames — a
+    "Closed Scope" program listing `corporate.abercrombie.com` as
+    asset_type URL means exactly that host, NOT
+    `staging.corporate.abercrombie.com` or any other subdomain; only an
+    explicit asset_type WILDCARD row (`*.example.com`) authorizes
+    suffix-matching. Losing this distinction (the pre-fix version
+    returned bare strings and every caller suffix-matched everything)
+    let Talon silently test/report on undiscovered-but-unauthorized
+    subdomains of any bare URL-type scope entry — confirmed in the
+    field: wafw00f fingerprinted staging.corporate.abercrombie.com
+    under a scope.csv that only ever listed the bare apex as URL."""
     with csv_path.open(newline="") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames or "identifier" not in reader.fieldnames:
@@ -113,7 +131,7 @@ def parse_scope_csv(csv_path: Path) -> list[str]:
             if asset_type not in SCOPE_CSV_WEB_ASSET_TYPES:
                 skipped_non_web += 1
                 continue
-            domains.append(_scope_csv_hostname(identifier))
+            domains.append((_scope_csv_hostname(identifier), asset_type == "WILDCARD"))
     if skipped_non_web:
         info(f"{skipped_non_web} non-web scope row(s) skipped (mobile apps, etc. — Talon only tests HTTP assets)")
     return sorted(set(domains))
