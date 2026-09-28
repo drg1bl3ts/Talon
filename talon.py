@@ -539,6 +539,9 @@ RECOMMENDATIONS = {
     "js_secrets": "Regex-matched a known secret format inside live JS source. Verify by hand first — check surrounding context for dummy/example/test keys before trusting it. If it's real: confirm scope (is it actually active?) and report immediately — a live credential in client-side JS is often a direct account or API compromise.",
     "takeover": "Nuclei matched a dangling-CNAME fingerprint (the platform's 'no such app'/'NoSuchBucket'-style error page). Verify manually before claiming: confirm the CNAME still points at the deprovisioned resource, then actually claim/register the resource yourself if the platform allows it — a fingerprint match without a successful claim isn't a confirmed takeover.",
     "cors": "Nuclei flagged a reflected/wildcard Access-Control-Allow-Origin. Check in {name} whether it's paired with Access-Control-Allow-Credentials: true (that combination is what actually enables cross-origin credentialed reads) — a permissive CORS header alone on a public endpoint often isn't exploitable.",
+    "headers": "Missing security header(s) (HSTS, CSP, X-Frame-Options, etc.) — mostly low/no bounty value on their own, but a missing X-Frame-Options/frame-ancestors is worth a quick clickjacking PoC (an iframe embed + an overlaid decoy button) if the page has a real state-changing action reachable without re-auth.",
+    "hardening": "Generic probes for blind XXE, CRLF injection, cache poisoning, and Host-header injection — all prone to false positives on generic response-based matchers. Verify each in {replay} by hand: for XXE, confirm actual out-of-band interaction; for cache poisoning, confirm the poisoned response is actually served back to a second, unheadered request.",
+    "graphql": "GraphQL endpoint and/or a dev-tool exposure (GraphiQL/Playground/Voyager) or misconfig (alias/array batching, GET-method bypass, field-suggestion leak) flagged. This is detection/misconfig only — hand off to the `graphql-hunter` agent for actual introspection, query-depth/batching abuse, and authorization testing.",
 }
 
 
@@ -874,6 +877,70 @@ def nuclei_takeover_scan(alive: Path, nuclei_dir: Path, rate: int, headers: list
     returncode = run_nuclei_with_progress(cmd, "nuclei:takeover")
     if returncode != 0:
         warn(f"nuclei takeover pass exited {returncode}")
+    return out if out.exists() else None
+
+
+def nuclei_headers_scan(alive: Path, nuclei_dir: Path, rate: int, headers: list[str] | None = None) -> Path | None:
+    """Missing/weak security headers (HSTS, CSP, X-Frame-Options — the
+    actual clickjacking check — X-Content-Type-Options, etc.) via nuclei's
+    own http-missing-security-headers template. severity:info like CORS,
+    so it needs its own pass rather than riding the host-level sweep."""
+    out = nuclei_dir / "nuclei_headers.jsonl"
+    cmd = [
+        "nuclei", "-silent", "-l", str(alive),
+        "-t", "http/misconfiguration/http-missing-security-headers.yaml",
+        "-etags", "dos", "-rate-limit", str(rate), "-jsonl", "-o", str(out),
+    ] + header_args(headers) + NUCLEI_STATS_FLAGS
+    returncode = run_nuclei_with_progress(cmd, "nuclei:headers")
+    if returncode != 0:
+        warn(f"nuclei security-headers pass exited {returncode}")
+    return out if out.exists() else None
+
+
+# Bundles five templates that don't fit any FUZZ_CLASSES bucket (no GF
+# pattern feeds them — they're host-level probes, not param-driven
+# candidates) but already ship inside the same two folders
+# GENERIC_FUZZ_TEMPLATES scopes, so this costs nothing extra to download:
+# generic blind XXE, CRLF injection, cache poisoning (x2), and Host-header
+# injection. All info/low/high severity — none survive the
+# severity:critical host-level sweep on their own. A sixth candidate,
+# cache-poisoning-fuzz.yaml, is tagged `fuzz` and excluded by nuclei's own
+# default .nuclei-ignore — same reason rce isn't in FUZZ_CLASSES either
+# (see that comment below); not worth fighting nuclei's own defaults for.
+HARDENING_TAGS = "xxe,crlf,cache,hostheader-injection"
+
+
+def nuclei_hardening_scan(alive: Path, nuclei_dir: Path, rate: int, headers: list[str] | None = None) -> Path | None:
+    out = nuclei_dir / "nuclei_hardening.jsonl"
+    cmd = [
+        "nuclei", "-silent", "-l", str(alive), "-tags", HARDENING_TAGS,
+        "-t", GENERIC_FUZZ_TEMPLATES,
+        "-etags", "dos", "-rate-limit", str(rate), "-jsonl", "-o", str(out),
+    ] + header_args(headers) + NUCLEI_STATS_FLAGS
+    returncode = run_nuclei_with_progress(cmd, "nuclei:hardening")
+    if returncode != 0:
+        warn(f"nuclei hardening pass exited {returncode}")
+    return out if out.exists() else None
+
+
+# GraphQL detection + the misconfiguration folder nuclei ships for it
+# (introspection-adjacent field-suggestion, exposed GraphiQL/Playground/
+# Voyager dev tools, alias/array batching, GET-method bypass). Not full
+# introspection exploitation or query-depth abuse — that's the
+# graphql-hunter agent's job once this flags an endpoint worth it.
+GRAPHQL_TEMPLATES = "http/technologies/graphql-detect.yaml,http/misconfiguration/graphql/"
+
+
+def nuclei_graphql_scan(alive: Path, nuclei_dir: Path, rate: int, headers: list[str] | None = None) -> Path | None:
+    out = nuclei_dir / "nuclei_graphql.jsonl"
+    cmd = [
+        "nuclei", "-silent", "-l", str(alive), "-tags", "graphql",
+        "-t", GRAPHQL_TEMPLATES,
+        "-etags", "dos", "-rate-limit", str(rate), "-jsonl", "-o", str(out),
+    ] + header_args(headers) + NUCLEI_STATS_FLAGS
+    returncode = run_nuclei_with_progress(cmd, "nuclei:graphql")
+    if returncode != 0:
+        warn(f"nuclei GraphQL pass exited {returncode}")
     return out if out.exists() else None
 
 
@@ -1409,6 +1476,7 @@ def _quick_reference_section(
     triage_dir: Path, gf_counts: dict, waf_findings: list, tech_by_host: dict, port_findings: list,
     ssrf_sink_hits: list | None = None, cms_versions: dict | None = None, xmlrpc_findings: list | None = None,
     cms_by_host: dict | None = None, vhost_hits: list | None = None, dirbrute_hits: list | None = None,
+    graphql_findings: list | None = None,
 ) -> list[str]:
     """The consolidated top-of-report block: WAF/CDN, tech stack, ports of
     interest, and SSRF signal-vs-noise — the exact manual cross-referencing
@@ -1473,6 +1541,11 @@ def _quick_reference_section(
     if dirbrute_hits:
         lines.append(f"**Directory brute-force:** {len(dirbrute_hits)} path(s) found — see `triage/dirbrute_findings.txt`")
 
+    graphql_findings = graphql_findings or []
+    if graphql_findings:
+        gql_urls = sorted({f["matched_at"] for f in graphql_findings if f.get("matched_at")})
+        lines.append(f"**GraphQL:** {len(gql_urls)} host(s) — {', '.join(gql_urls)} (see Recommendations by Class → graphql, and the `graphql-hunter` agent for follow-up)")
+
     ssrf_raw = gf_counts.get("ssrf", 0)
     ssrf_nuclei = count_lines(triage_dir / "nuclei" / "nuclei_ssrf.jsonl")
     ssrf_sink_hits = ssrf_sink_hits or []
@@ -1525,6 +1598,7 @@ def write_recommendations_md(
     waf_findings: list | None = None, tech_by_host: dict | None = None, port_findings: list | None = None,
     ssrf_sink_hits: list | None = None, cms_versions: dict | None = None, xmlrpc_findings: list | None = None,
     cms_by_host: dict | None = None, vhost_hits: list | None = None, dirbrute_hits: list | None = None,
+    headers_findings: list | None = None, hardening_findings: list | None = None, graphql_findings: list | None = None,
 ) -> Path:
     sev = severity_breakdown(findings)
     lines = []
@@ -1538,6 +1612,7 @@ def write_recommendations_md(
     lines.extend(_quick_reference_section(
         triage_dir, gf_counts, waf_findings or [], tech_by_host or {}, port_findings or [], ssrf_sink_hits or [],
         cms_versions or {}, xmlrpc_findings or [], cms_by_host or {}, vhost_hits or [], dirbrute_hits or [],
+        graphql_findings or [],
     ))
 
     if has_prev_run:
@@ -1629,6 +1704,24 @@ def write_recommendations_md(
         lines.append(RECOMMENDATIONS["cors"].format(**terms))
         for f in cors_findings:
             lines.append(f"- {f['matched_at']}")
+    headers_findings = headers_findings or []
+    if headers_findings:
+        lines.append(f"\n### headers ({len(headers_findings)} finding{'s' if len(headers_findings) != 1 else ''})")
+        lines.append(RECOMMENDATIONS["headers"].format(**terms))
+        for f in headers_findings:
+            lines.append(f"- {f['name']} — {f['matched_at']}")
+    hardening_findings = hardening_findings or []
+    if hardening_findings:
+        lines.append(f"\n### hardening — xxe/crlf/cache/hostheader ({len(hardening_findings)} finding{'s' if len(hardening_findings) != 1 else ''})")
+        lines.append(RECOMMENDATIONS["hardening"].format(**terms))
+        for f in hardening_findings:
+            lines.append(f"- `{f['severity']}` {f['template_id']} — {f['matched_at']}")
+    graphql_findings = graphql_findings or []
+    if graphql_findings:
+        lines.append(f"\n### graphql ({len(graphql_findings)} finding{'s' if len(graphql_findings) != 1 else ''})")
+        lines.append(RECOMMENDATIONS["graphql"].format(**terms))
+        for f in graphql_findings:
+            lines.append(f"- {f['template_id']} — {f['matched_at']}")
 
     out = triage_dir / "RECOMMENDATIONS.md"
     out.write_text("\n".join(lines) + "\n")
@@ -1967,9 +2060,15 @@ def main():
         host_out = nuclei_host_scan(alive_path, nuclei_dir, args.rate, args.headers)
     cors_out = nuclei_cors_scan(alive_path, nuclei_dir, args.rate, args.headers)
     cors_findings = parse_nuclei_jsonl([cors_out] if cors_out else [])
+    headers_out = nuclei_headers_scan(alive_path, nuclei_dir, args.rate, args.headers)
+    headers_findings = parse_nuclei_jsonl([headers_out] if headers_out else [])
+    hardening_out = nuclei_hardening_scan(alive_path, nuclei_dir, args.rate, args.headers)
+    hardening_findings = parse_nuclei_jsonl([hardening_out] if hardening_out else [])
+    graphql_out = nuclei_graphql_scan(alive_path, nuclei_dir, args.rate, args.headers)
+    graphql_findings = parse_nuclei_jsonl([graphql_out] if graphql_out else [])
     class_outs = nuclei_class_scans(triage_dir, nuclei_dir, args.rate, active_fuzz_classes, args.headers, args.max_candidates)
     all_paths = ([host_out] if host_out else []) + [p for _, p in class_outs]
-    findings = parse_nuclei_jsonl(all_paths) + cors_findings
+    findings = parse_nuclei_jsonl(all_paths) + cors_findings + headers_findings + hardening_findings + graphql_findings
     success(f"nuclei complete — {len(findings)} finding(s)")
 
     phase("SUBDOMAIN TAKEOVER CHECK")
@@ -2041,6 +2140,7 @@ def main():
         terms, active_fuzz_classes + active_manual_classes, skipped_classes,
         waf_findings, tech_by_host, port_findings, ssrf_sink_hits, cms_versions, xmlrpc_findings,
         cms_by_host, vhost_hits, dirbrute_hits,
+        headers_findings, hardening_findings, graphql_findings,
     )
     json_path = write_json_summary(
         triage_dir, target_label, url_count, gf_counts, ext_live_count, dangerous_count,

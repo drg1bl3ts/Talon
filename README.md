@@ -14,12 +14,18 @@ It calls the underlying recon tools (subfinder, httpx, dnsx, naabu, katana, asse
 - **Scope filter** *(optional, `--scope-file`)* — drops anything outside an explicit in-scope allowlist before a single request goes out to fuzzing, JS scanning, or the proxy warm-up
 - **GF pattern triage** — buckets endpoints and params into vuln-class candidates (xss, sqli, ssrf, lfi, rce, ssti, redirect, idor, interestingparams, debug_logic, img-traversal)
 - **Vulnerability-class filter** *(optional, `--xss`/`--ssrf`/`--lfi`/etc.)* — recon always runs in full, but triage (gf matching, nuclei fuzzing, and the manual queue) can be narrowed to just the classes you flag, e.g. `--ssrf --lfi` skips every other class entirely instead of triaging all 11 every run
+- **SSRF sink classifier** — cross-references `ssrf_candidates.txt` against known real-world SSRF sink shapes (oEmbed/Jetpack routes, SAML/OIDC ACS callbacks, webhook registration, link-unfurl/preview, PDF/render endpoints, etc.) and the confirmed-alive host list, so the SSRF manual queue is high-confidence candidates instead of every GF hit
+- **WAF/CDN detection** (`wafw00f`) — one representative host per apex domain, feeds the Quick Reference block and the manual-testing guidance (skip with `--no-waf-detect`)
+- **Port/service triage** — labels naabu's discovered ports by likely service and cross-references them against every vuln-class candidate, confirmed with a scoped nuclei `-pt tcp` pass rather than just guessed by port number (skip the nuclei confirmation with `--no-port-triage`)
+- **CMS fingerprint** (optional — [CMSeeK](https://github.com/Tuhinshubhra/CMSeeK)) — detects CMS name per alive host, extracts version numbers where a reliable technique exists (WordPress, Drupal, Joomla), and checks `xmlrpc.php`/`pingback.ping` exposure on WordPress hosts as an SSRF primitive (skip the live xmlrpc check with `--no-cms-probe`). Degrades gracefully — CMS detection simply doesn't run if CMSeeK isn't installed
 - **Live-exposure check** with high-risk extension filtering (`.git`, `.env`, `.sql`, `.bak`, etc. — separated from ordinary public files)
 - **JS secret scan** — fetches every `.js` URL via httpx's native `-extract-regex` (no hand-rolled curl loop) and checks it against known secret formats (AWS/Google/Stripe/Slack/GitHub keys, JWTs, private key blocks, generic `api_key=` assignments)
-- **nuclei** — a host-level `severity:critical` sweep, a dedicated CORS misconfig pass, a per-class pass scoped to generic parameter-injection templates (not every CVE template with that tag — measured 67x fewer requests than unrestricted tag matching, same real coverage), and a subdomain-takeover pass (73 templates). DoS-tagged templates are always excluded via `-etags dos`, since most programs prohibit DoS testing
+- **nuclei** — a host-level `severity:critical` sweep, a dedicated CORS misconfig pass, a security-headers/clickjacking pass, a hardening pass (blind XXE, CRLF injection, cache poisoning, Host-header injection), a GraphQL detection + misconfig pass (exposed GraphiQL/Playground/Voyager, batching/GET-method bypass, field-suggestion leak — hands off to the `graphql-hunter` agent for actual exploitation), a per-class pass scoped to generic parameter-injection templates (not every CVE template with that tag — measured 67x fewer requests than unrestricted tag matching, same real coverage), and a subdomain-takeover pass (73 templates). All of the above reuse templates already inside the nuclei-templates checkout the installer pre-fetches — no extra tool or download. DoS-tagged templates are always excluded via `-etags dos`, since most programs prohibit DoS testing
+- **Vhost fuzzing** *(opt-in, `--vhost-fuzz`)* — Host-header fuzzing via `ffuf` against SecLists' DNS wordlist, one apex per representative host. OFF by default: thousands of requests per apex, higher volume than anything else in the pipeline, and aggressive WAFs will rate-limit-block over it
+- **Directory bruteforce** *(opt-in, `--dir-brute`)* — recursive content discovery via `feroxbuster` against SecLists' common wordlist, per alive/in-scope host, depth-limited. Same volume/WAF caveat as `--vhost-fuzz`
 - **Manual-testing queue** with optional proxy warm-up (`--proxy caido` or `--proxy burp`) for everything nuclei can't fingerprint on its own (IDOR, feature-flag logic, confirmed secrets, possible takeovers, "worth a closer look" params)
 - **Run-over-run diff** — every run is compared against the last one for the same target; `RECOMMENDATIONS.md` leads with a "New Since Last Run" section so re-running against a program you're already watching doesn't mean re-reading everything
-- A data-driven `RECOMMENDATIONS.md` that only shows guidance for classes that actually had candidates, not static boilerplate
+- A data-driven `RECOMMENDATIONS.md` that leads with a **Quick Reference** block (WAF/CDN, tech stack, ports of interest, SSRF signal-vs-noise) and only shows guidance for classes that actually had candidates, not static boilerplate
 - **One live progress bar per phase** — on a real terminal, each tool's status redraws in place with no scrollback spam; when output is piped, redirected, or logged (where in-place redraw doesn't survive), it automatically falls back to a handful of milestone lines instead of a wall of broken fragments
 
 ### Workflow
@@ -32,6 +38,11 @@ Target domain(s)
   ▼
 recon.py — subdomains → alive → DNS → ports → crawl+waymore → params
   │
+  ├── fresh_alive_domains ──→ wafw00f (WAF/CDN)         *(--no-waf-detect skips)*
+  ├── naabu.txt            ──→ port/service triage       *(--no-port-triage skips nuclei confirm)*
+  ├── fresh_alive_domains ──→ CMSeeK (CMS name+version, xmlrpc.php) *(optional, --no-cms-probe skips xmlrpc)*
+  ├── fresh_alive_domains ──→ ffuf vhost fuzz            *(opt-in: --vhost-fuzz)*
+  ├── fresh_alive_domains ──→ feroxbuster dir brute      *(opt-in: --dir-brute)*
   ├── endpoints.txt  ─┐
   └── params/all.txt ─┴─→ GF triage ─→ candidates/*.txt
                                   │
@@ -41,10 +52,11 @@ recon.py — subdomains → alive → DNS → ports → crawl+waymore → params
              xss/sqli/ssrf/     idor            │
              lfi/rce/ssti/ interestingparams    ▼
              redirect/     debug_logic    httpx -extract-regex
-             img-traversal                (AWS/Google/Stripe/
-                    │             │         Slack/GitHub/JWT/…)
+             img-traversal   (SSRF sink     (AWS/Google/Stripe/
+                              classifier)    Slack/GitHub/JWT/…)
                     │             │             │
-        fresh_alive_domains ──→ nuclei: CORS + takeover (73 templates)
+        fresh_alive_domains ──→ nuclei: CORS + headers + hardening +
+                    │             │       graphql + takeover (73 templates)
                     │             │             │
                     └─────────────┼─────────────┘
                                   ▼
@@ -57,7 +69,7 @@ recon.py — subdomains → alive → DNS → ports → crawl+waymore → params
                   diff vs. talon_state.json (last run)
                                   │
                                   ▼
-                   RECOMMENDATIONS.md + talon_summary.json
+      RECOMMENDATIONS.md (Quick Reference + findings) + talon_summary.json
 ```
 
 ---
@@ -68,7 +80,9 @@ recon.py — subdomains → alive → DNS → ports → crawl+waymore → params
 chmod +x Installer.sh && ./Installer.sh
 ```
 
-The installer sets up everything: Go, the recon toolchain (subfinder/httpx/dnsx/naabu/katana/assetfinder/anew/subfaster/findomain), the triage toolchain (gf/nuclei/notify), and the Python side (waymore/paramspider, via a dedicated venv at `~/.talon-venv`).
+The installer sets up everything: Go, the recon toolchain (subfinder/httpx/dnsx/naabu/katana/assetfinder/anew/subfaster/findomain), the triage toolchain (gf/nuclei/notify/ffuf/feroxbuster), the Python side (waymore/paramspider/wafw00f, via a dedicated venv at `~/.talon-venv`), and two best-effort optional extras that Talon degrades gracefully without: CMSeeK (cloned to `~/Tools/CMSeeK`, powers CMS fingerprinting) and SecLists (installed via your package manager where available, powers `--vhost-fuzz`/`--dir-brute`).
+
+`wafw00f` is the one dependency here that isn't optional — Talon runs WAF/CDN detection by default (`--no-waf-detect` to skip), so a run will refuse to start without it on `PATH`.
 
 ---
 
@@ -84,12 +98,18 @@ The installer sets up everything: Go, the recon toolchain (subfinder/httpx/dnsx/
 | `--scope-file` | One in-scope domain per line (apex or `*.sub.domain`), or a HackerOne scope CSV export (`.csv` extension). Filters `all_urls.txt` and `fresh_alive_domains` before anything downstream touches them |
 | `--rate` | nuclei/httpx `-rate-limit` (default: 50 — this is live production infrastructure, not a lab box) |
 | `-H, --header` | Custom header added to every live HTTP request Talon makes — recon (httpx/katana), triage (httpx/nuclei), and the proxy warm-up (curl). Repeatable, e.g. `-H 'X-HackerOne-Researcher: yourname'` |
-| `--proxy` | `caido` or `burp` — routes the manual-review queue through that tool's warm-up (`curl -x http://127.0.0.1:8080`; both tools default to that same address, so there's no separate address flag) and picks the wording used in progress messages and `RECOMMENDATIONS.md` (Caido Replay/Sitemap vs. Burp Repeater/HTTP history). Omit to skip the warm-up entirely (default — also drops the `curl` requirement, since that's its only caller) |
+| `--proxy` | `caido` or `burp` — routes the manual-review queue through that tool's warm-up (`curl -x http://127.0.0.1:8080`; both tools default to that same address, so there's no separate address flag) and picks the wording used in progress messages and `RECOMMENDATIONS.md` (Caido Replay/Sitemap vs. Burp Repeater/HTTP history). Omit to skip the warm-up entirely (default). Note `curl` is still required by default regardless — see `--no-cms-probe` |
 | `--proxy-timeout` | Per-request curl `--max-time` for the proxy warm-up, seconds (default: 10) |
-| `--proxy-delay` | Delay between proxy warm-up requests, seconds (default: 0.2) |
+| `--proxy-delay` | Delay between proxy warm-up requests, seconds (default: derived from `--rate`, so the warm-up never exceeds the same requests/sec ceiling as everything else) |
 | `--xss`, `--sqli`, `--ssrf`, `--lfi`, `--ssti`, `--img-traversal`, `--redirect`, `--idor`, `--interestingparams`, `--debug-logic`, `--rce` | Opt-in vulnerability-class filter. With none set, every class is triaged (default). Set one or more to restrict gf triage + nuclei fuzzing + the manual queue to just those classes — recon itself is unaffected |
+| `--max-candidates` | Cap each fuzz class's deduped candidate list to this many (random sample) before nuclei scans it — bounds worst-case runtime on a URL-rich target (default: unlimited) |
 | `--no-js-scan` | Skip fetching `.js` files and scanning them for hardcoded secrets |
 | `--no-host-scan` | Skip the all-host `severity:critical` CVE/misconfig sweep — the expensive one (roughly 1,870 templates times every alive host, hours on a large target). CORS, takeover, and per-class fuzzing passes still run and are the faster, higher-signal ones anyway |
+| `--no-waf-detect` | Skip the `wafw00f` WAF/CDN detection pass (one representative host per apex domain) — also drops `wafw00f` from the required-tools check |
+| `--no-port-triage` | Skip the nuclei `-pt tcp` confirmation pass for naabu-discovered ports — the static port→service labeling and Quick Reference cross-referencing still run |
+| `--no-cms-probe` | Skip the live `xmlrpc.php`/`pingback.ping` check on WordPress-detected hosts — CMS/plugin version fingerprinting from already-crawled `?ver=` query strings still runs |
+| `--vhost-fuzz` | Opt-in: fuzz for virtual hosts via `ffuf` (Host-header fuzzing against SecLists' DNS wordlist), one apex per representative host. OFF by default — thousands of requests per apex, and aggressive WAFs will rate-limit-block over it. Requires `ffuf` + SecLists |
+| `--dir-brute` | Opt-in: recursive directory/file brute-force via `feroxbuster` (SecLists' common wordlist), per alive/in-scope host, depth-limited. Same volume/WAF caveat as `--vhost-fuzz`. Requires `feroxbuster` + SecLists |
 | `--discord` | Send a clean one-line summary via `notify` when done (requires a configured provider at `~/.config/notify/provider-config.yaml`) |
 | `-v, --verbose` | Verbose logging (debug-level subprocess command traces) |
 | `--quiet` | Suppress the startup banner |
@@ -199,16 +219,21 @@ And in `results/<target>/triage/`:
 | `fresh_alive_domains.inscope` | Only written with `--scope-file` — the alive-host list after dropping out-of-scope entries |
 | `all_urls.txt` | `endpoints.txt` + `params/all.txt`, merged, deduped, and scope-filtered if `--scope-file` was given |
 | `<class>_candidates.txt` | GF pattern matches per vuln class |
+| `ssrf_candidates.txt` | `ssrf` GF matches after the SSRF sink classifier — deduped, alive-host-confirmed, matched against known real-world SSRF sink shapes |
 | `interestingEXT_live.txt` | Candidates from `interestingEXT` confirmed live (HTTP 200) |
 | `interestingEXT_dangerous.txt` | The subset of those that matched a high-risk extension (git/env/sql/backup/config/key/etc.) — everything else is presumed public |
 | `js_urls.txt` | Every `.js` URL pulled out of `all_urls.txt` |
 | `js_secrets.jsonl` / `js_secrets.txt` | Regex hits from the JS secret scan (type, URL, matched string) |
 | `js_secrets_urls.txt` | Just the JS URLs that had a hit — feeds `manual_review.txt` |
+| `waf_detect.json` | wafw00f results per apex domain (WAF/CDN vendor, if detected) |
+| `cmseek/<host>.json` | CMSeeK's raw per-host result, copied out of CMSeeK's own result tree (only written if CMSeeK is installed and detects something) |
+| `vhosts_found.txt` | Only written with `--vhost-fuzz` — vhosts ffuf found that weren't already in DNS/crawl results |
+| `dirbrute_findings.txt` | Only written with `--dir-brute` — paths feroxbuster found |
 | `takeover_urls.txt` | Hosts nuclei's takeover templates flagged — feeds `manual_review.txt` (always verify by hand before claiming) |
-| `nuclei/*.jsonl` | Raw nuclei output — host-level, CORS, takeover, and per-class passes |
+| `nuclei/*.jsonl` | Raw nuclei output — host-level, CORS, security-headers, hardening (XXE/CRLF/cache/host-header), GraphQL, takeover, port-triage, and per-class passes |
 | `manual_review.txt` | Deduped queue of everything nuclei can't fingerprint on its own |
 | `talon_state.json` | Snapshot of this run's findings, used to compute the "New Since Last Run" diff on the next run |
-| `RECOMMENDATIONS.md` | Human-readable report — new-since-last-run, counts, nuclei findings table, and dedicated per-vuln-class guidance worded for Caido or Burp Suite (`--proxy`), plus takeover and CORS findings (only sections with actual findings are shown) |
+| `RECOMMENDATIONS.md` | Human-readable report — leads with a Quick Reference block (WAF/CDN, tech stack, ports of interest, SSRF signal-vs-noise), then new-since-last-run, counts, nuclei findings table, and dedicated per-vuln-class guidance worded for Caido or Burp Suite (`--proxy`), plus takeover and CORS findings (only sections with actual findings are shown) |
 | `talon_summary.json` | The same data, structured, for chaining into other tooling |
 
 ---
@@ -218,7 +243,9 @@ And in `results/<target>/triage/`:
 Talon shells out to:
 
 **Recon** — subfinder, httpx, dnsx, naabu, katana, assetfinder, findomain, subfaster, waymore, paramspider, anew
-**Triage** — gf (needs `~/.gf` populated, see below), nuclei, httpx, anew, and curl (only required when `--proxy` is set, since that's the only thing that calls curl)
+**Triage** — gf (needs `~/.gf` populated, see below), nuclei, httpx, anew, wafw00f, and curl (required unless both `--proxy` is unset and `--no-cms-probe` is passed — it's called by the proxy warm-up and by the WordPress `xmlrpc.php` check, so it's on by default)
+**Opt-in** — ffuf (`--vhost-fuzz`), feroxbuster (`--dir-brute`) — both require SecLists' wordlists too
+**Optional, degrades gracefully** — CMSeeK (CMS fingerprinting simply doesn't run if it's not found at `~/Tools/CMSeeK`)
 **Optional** — notify (only used with `--discord`)
 
 GF ships with zero patterns of its own — `Installer.sh` clones [1ndianl33t/Gf-Patterns](https://github.com/1ndianl33t/Gf-Patterns) into `~/.gf` if it's not already there.
