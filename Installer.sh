@@ -11,12 +11,21 @@
 #     subfinder, httpx, dnsx, naabu, katana         (recon)
 #     assetfinder, anew, subfaster                   (recon)
 #     gf, nuclei, notify                              (triage)
+#     ffuf                                            (triage, --vhost-fuzz)
 #
 #   Other:
 #     findomain                                       (recon)
-#     waymore, paramspider                            (recon, via a venv)
+#     waymore, paramspider, wafw00f                   (recon/triage, via a venv)
+#     feroxbuster                                      (triage, --dir-brute)
 #     GF pattern definitions (~/.gf)                   (triage)
 #     nuclei-templates                                 (triage, pre-fetched)
+#     CMSeeK (~/Tools/CMSeeK)                           (triage, CMS fingerprint — optional, best-effort)
+#     SecLists (/usr/share/seclists)                    (triage, --vhost-fuzz/--dir-brute wordlists — optional, best-effort)
+#
+# wafw00f is a hard runtime dependency by default (talon.py only skips it
+# with --no-waf-detect) — everything else in this list is either opt-in
+# (ffuf/feroxbuster/SecLists) or degrades gracefully at runtime if missing
+# (CMSeeK).
 #
 # Supported platforms:
 #   - Debian / Ubuntu / Kali / Mint
@@ -528,6 +537,7 @@ go_install "github.com/melvinsh/subfaster/v2/cmd/subfaster@latest"         "subf
 go_install "github.com/tomnomnom/gf@latest"                          "gf"
 go_install "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest" "nuclei"
 go_install "github.com/projectdiscovery/notify/cmd/notify@latest"    "notify"
+go_install "github.com/ffuf/ffuf/v2@latest"                          "ffuf"
 
 ok "Go-based tools processed."
 
@@ -613,6 +623,88 @@ install_findomain() {
 install_findomain
 
 # ──────────────────────────────────────────────────────────────
+# FEROXBUSTER
+# (used by --dir-brute — opt-in, but talon.py -h advertises it, so it
+# should actually be there)
+# ──────────────────────────────────────────────────────────────
+
+install_feroxbuster() {
+    if bin_exists feroxbuster; then
+        ok "feroxbuster already installed — skipping."
+        return
+    fi
+
+    case "$PKG_MANAGER" in
+        brew)
+            info "Installing feroxbuster with Homebrew..."
+            if brew install feroxbuster >/dev/null 2>&1; then
+                ok "feroxbuster installed."
+                return
+            fi
+            ;;
+        apt)
+            info "Installing feroxbuster with apt..."
+            if $SUDO apt-get install -y -qq feroxbuster >/dev/null 2>&1; then
+                ok "feroxbuster installed."
+                return
+            fi
+            ;;
+        pacman)
+            info "Installing feroxbuster with pacman..."
+            if $SUDO pacman -S --needed --noconfirm feroxbuster >/dev/null 2>&1; then
+                ok "feroxbuster installed."
+                return
+            fi
+            ;;
+    esac
+
+    local arch asset tmp_fx url
+    arch="$(uname -m)"
+
+    case "${OS}:${arch}" in
+        linux:x86_64 | linux:amd64)   asset="x86_64-linux-feroxbuster.zip"  ;;
+        linux:aarch64 | linux:arm64)  asset="aarch64-linux-feroxbuster.zip" ;;
+        linux:armv7l)                 asset="armv7-linux-feroxbuster.zip"  ;;
+        macos:x86_64 | macos:amd64)   asset="x86_64-macos-feroxbuster.zip"  ;;
+        macos:arm64 | macos:aarch64)  asset="x86_64-macos-feroxbuster.zip" ;;
+        *)
+            warn "No known prebuilt feroxbuster binary for ${OS}/${arch}."
+            warn "--dir-brute will be unavailable until it's installed manually: https://github.com/epi052/feroxbuster"
+            return
+            ;;
+    esac
+
+    tmp_fx="$(mktemp -d)"
+    url="https://github.com/epi052/feroxbuster/releases/latest/download/${asset}"
+
+    info "Downloading feroxbuster..."
+
+    if curl -fsSL "$url" -o "$tmp_fx/feroxbuster.zip"; then
+        if unzip -q -o "$tmp_fx/feroxbuster.zip" -d "$tmp_fx"; then
+            local binary
+            binary="$(find "$tmp_fx" -type f -name 'feroxbuster' -print -quit)"
+
+            if [[ -n "$binary" ]]; then
+                chmod +x "$binary"
+                $SUDO install -m 0755 "$binary" /usr/local/bin/feroxbuster
+                ok "feroxbuster installed to /usr/local/bin/feroxbuster."
+            else
+                warn "feroxbuster archive did not contain the expected binary."
+                warn "--dir-brute will be unavailable until it's installed manually."
+            fi
+        else
+            warn "Could not extract feroxbuster archive. --dir-brute will be unavailable until installed manually."
+        fi
+    else
+        warn "Could not download feroxbuster. --dir-brute will be unavailable until installed manually."
+    fi
+
+    rm -rf "$tmp_fx"
+}
+
+install_feroxbuster
+
+# ──────────────────────────────────────────────────────────────
 # PYTHON ENVIRONMENT
 # (dedicated venv — no --break-system-packages needed)
 # ──────────────────────────────────────────────────────────────
@@ -640,6 +732,15 @@ install_python_tools() {
         info "Installing ParamSpider from GitHub..."
         "$PYTHON_VENV/bin/python" -m pip install --upgrade \
             "git+https://github.com/devanshbatham/ParamSpider.git" >/dev/null
+    fi
+
+    if [[ -x "${PYTHON_VENV}/bin/wafw00f" ]] || command -v wafw00f >/dev/null 2>&1; then
+        ok "wafw00f already installed — skipping."
+    else
+        # talon.py requires wafw00f by default (only --no-waf-detect skips
+        # it) — unlike waymore/paramspider this one isn't optional.
+        info "Installing wafw00f..."
+        "$PYTHON_VENV/bin/python" -m pip install --upgrade wafw00f >/dev/null
     fi
 
     add_path_line "${PYTHON_VENV}/bin"
@@ -672,6 +773,68 @@ else
         rm -rf "$TMP_GF"
         fail "Could not clone the GF pattern set — Talon's triage stage needs these."
         fail "Install manually: git clone https://github.com/1ndianl33t/Gf-Patterns and copy *.json into ${GF_DIR}"
+    fi
+fi
+
+# ──────────────────────────────────────────────────────────────
+# CMSEEK
+# (optional — talon.py's detect_cms_names() checks for
+# ~/Tools/CMSeeK/cmseek.py itself and simply skips CMS detection if it's
+# not there, so failures here are never fatal to the installer)
+# ──────────────────────────────────────────────────────────────
+
+info "Checking CMSeeK (optional — CMS fingerprint pass)..."
+
+CMSEEK_DIR="${HOME}/Tools/CMSeeK"
+
+if [[ -f "${CMSEEK_DIR}/cmseek.py" ]]; then
+    ok "CMSeeK already present at ${CMSEEK_DIR}"
+else
+    mkdir -p "${HOME}/Tools"
+    if git clone --depth 1 --quiet https://github.com/Tuhinshubhra/CMSeeK "$CMSEEK_DIR" 2>/dev/null; then
+        if [[ -f "${CMSEEK_DIR}/requirements.txt" ]]; then
+            # CMSeeK is invoked by talon.py via the system `python3`, not
+            # Talon's own venv, so its deps need to land where that
+            # python3 can see them.
+            if "$PYTHON_BIN" -m pip install --user -r "${CMSEEK_DIR}/requirements.txt" >/dev/null 2>&1; then
+                ok "CMSeeK installed to ${CMSEEK_DIR}"
+            else
+                warn "CMSeeK cloned but its Python dependencies failed to install."
+                warn "CMS fingerprinting will be skipped until: pip install --user -r ${CMSEEK_DIR}/requirements.txt"
+            fi
+        else
+            ok "CMSeeK installed to ${CMSEEK_DIR}"
+        fi
+    else
+        warn "Could not clone CMSeeK — CMS fingerprinting will be skipped (this is non-fatal)."
+        warn "Install manually: git clone https://github.com/Tuhinshubhra/CMSeeK ${CMSEEK_DIR}"
+    fi
+fi
+
+# ──────────────────────────────────────────────────────────────
+# SECLISTS
+# (optional — only used by --vhost-fuzz/--dir-brute, which talon.py
+# itself skips with a warning if the wordlist files aren't found, so a
+# failed/unavailable install here is also never fatal. Not git-cloned
+# directly: the full SecLists repo is several hundred MB, too large to
+# pull unconditionally on every install.)
+# ──────────────────────────────────────────────────────────────
+
+info "Checking SecLists (optional — --vhost-fuzz/--dir-brute wordlists)..."
+
+if [[ -f /usr/share/seclists/Discovery/DNS/combined_subdomains.txt ]]; then
+    ok "SecLists already present at /usr/share/seclists"
+else
+    case "$PKG_MANAGER" in
+        apt)    $SUDO apt-get install -y -qq seclists >/dev/null 2>&1 && ok "SecLists installed." || warn "seclists package not available via apt on this distro." ;;
+        pacman) $SUDO pacman -S --needed --noconfirm seclists >/dev/null 2>&1 && ok "SecLists installed." || warn "seclists package not available via pacman (try an AUR helper: yay -S seclists)." ;;
+        dnf)    $SUDO dnf install -y seclists >/dev/null 2>&1 && ok "SecLists installed." || warn "seclists package not available via dnf on this distro." ;;
+        brew)   brew install seclists >/dev/null 2>&1 && ok "SecLists installed." || warn "seclists package not available via brew." ;;
+        *)      warn "No known seclists package for ${PKG_MANAGER}." ;;
+    esac
+    if [[ ! -f /usr/share/seclists/Discovery/DNS/combined_subdomains.txt ]]; then
+        warn "--vhost-fuzz/--dir-brute will skip with a warning until SecLists is installed manually:"
+        warn "  git clone https://github.com/danielmiessler/SecLists /usr/share/seclists"
     fi
 fi
 
@@ -725,8 +888,8 @@ TOOLS=(
     curl jq go python3
     subfinder httpx dnsx naabu katana
     assetfinder anew subfaster findomain
-    waymore paramspider
-    gf nuclei notify
+    waymore paramspider wafw00f
+    gf nuclei notify ffuf feroxbuster
     talon
 )
 
@@ -735,11 +898,27 @@ FAILED=0
 for tool in "${TOOLS[@]}"; do
     if command -v "$tool" >/dev/null 2>&1; then
         printf '  %b\xE2\x9C\x93%b %-12s %s\n' "$GREEN" "$RESET" "$tool" "$(command -v "$tool")"
+    elif [[ "$tool" == "ffuf" || "$tool" == "feroxbuster" ]]; then
+        # Opt-in features (--vhost-fuzz/--dir-brute) — missing binary
+        # doesn't block a default run, so it's a warning, not a failure.
+        printf '  %b!%b %-12s %s\n' "$YELLOW" "$RESET" "$tool" "NOT FOUND (only needed for --vhost-fuzz/--dir-brute)"
     else
         printf '  %b\xE2\x9C\x97%b %-12s %s\n' "$RED" "$RESET" "$tool" "NOT FOUND"
         FAILED=1
     fi
 done
+
+if [[ -f "${HOME}/Tools/CMSeeK/cmseek.py" ]]; then
+    printf '  %b\xE2\x9C\x93%b %-12s %s\n' "$GREEN" "$RESET" "cmseek" "${HOME}/Tools/CMSeeK/cmseek.py"
+else
+    printf '  %b!%b %-12s %s\n' "$YELLOW" "$RESET" "cmseek" "NOT FOUND (CMS fingerprint pass will be skipped — non-fatal)"
+fi
+
+if [[ -f /usr/share/seclists/Discovery/DNS/combined_subdomains.txt ]]; then
+    printf '  %b\xE2\x9C\x93%b %-12s %s\n' "$GREEN" "$RESET" "seclists" "/usr/share/seclists"
+else
+    printf '  %b!%b %-12s %s\n' "$YELLOW" "$RESET" "seclists" "NOT FOUND (only needed for --vhost-fuzz/--dir-brute)"
+fi
 
 printf '\n'
 
