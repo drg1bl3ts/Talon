@@ -87,53 +87,104 @@ def _scope_csv_hostname(identifier: str) -> str:
     return identifier.lstrip("*.").lstrip(".")
 
 
-# Asset types a domain/URL-based scope filter can actually apply to. H1
-# scope exports also list mobile app store IDs, source-code repos, etc. —
-# those can't be matched against a hostname, so they're dropped rather than
-# silently mismatching every URL Talon collects (or worse, matching none
-# and emptying scope entirely).
-SCOPE_CSV_WEB_ASSET_TYPES = {"URL", "WILDCARD"}
+# Column-name aliases per semantic field, first match wins. HackerOne's
+# export (identifier/asset_type/eligible_for_submission) was confirmed
+# against a real program export — see the WILDCARD/URL comment below.
+# Bugcrowd's "Scope" tab CSV export typically uses target/type/in_scope
+# instead, but this has NOT been hands-on verified against a real live
+# Bugcrowd export this session (unlike the H1 format) — column names are
+# reported to vary by program/export version. Detection is deliberately
+# tolerant (several aliases, case-insensitive) and fails loudly with the
+# actual header row if nothing matches, rather than silently mis-parsing
+# an unrecognized format into an empty or wrong scope list.
+IDENTIFIER_COLUMNS = ("identifier", "target", "asset", "target_name", "name")
+TYPE_COLUMNS = ("asset_type", "type", "category")
+ELIGIBLE_COLUMNS = ("eligible_for_submission", "in_scope", "in scope", "eligible")
+
+# Asset-type values (uppercased) that a domain/URL-based scope filter can
+# actually apply to. Both platforms' exports also list mobile app store
+# IDs, source-code repos, hardware/IoT, "Other", etc. — those can't be
+# matched against a hostname, so any type NOT in this set is dropped
+# rather than silently mismatching every URL Talon collects. This is
+# deliberately conservative: an unrecognized type is treated as non-web
+# and skipped (with a warning) rather than risk pulling something
+# out-of-scope into the allowlist — the same reasoning as the WILDCARD/
+# URL distinction below, not a shortcut around it.
+SCOPE_CSV_WEB_ASSET_TYPES = {
+    "URL", "WILDCARD",  # HackerOne
+    "WEBSITE", "WEB APPLICATION", "API", "DOMAIN",  # Bugcrowd (unverified column values)
+}
+# Asset-type values that authorize suffix-matching (a program explicitly
+# listing `*.example.com`, not just `example.com`). HackerOne uses a
+# dedicated WILDCARD asset_type; Bugcrowd programs more often just put
+# the `*.` directly in the target string with a generic type, so
+# wildcard-ness there is detected from the identifier itself (see
+# _scope_csv_hostname's caller below), not from this set.
+SCOPE_CSV_WILDCARD_TYPES = {"WILDCARD"}
+
+
+def _first_present(fieldnames: list[str], aliases: tuple[str, ...]) -> str | None:
+    lower_map = {fn.lower(): fn for fn in fieldnames}
+    for alias in aliases:
+        if alias in lower_map:
+            return lower_map[alias]
+    return None
 
 
 def parse_scope_csv(csv_path: Path) -> list[tuple[str, bool]]:
-    """Parses a HackerOne scope export (Program page -> Scope -> Download
-    CSV): identifier,asset_type,instruction,eligible_for_bounty,
-    eligible_for_submission,... Keeps only URL/WILDCARD rows marked
-    eligible_for_submission (missing/blank counts as eligible — some
-    exports omit the column entirely). Shared by --scope-file (talon.py)
-    and -l/--list (recon.py) so both parse a raw H1 export identically —
-    pass the same CSV to both flags instead of hand-building a domain
-    list.
+    """Parses a HackerOne or Bugcrowd scope export into (hostname,
+    is_wildcard) pairs. Shared by --scope-file (talon.py) and -l/--list
+    (recon.py) so both parse a raw export identically — pass the same
+    CSV to both flags instead of hand-building a domain list.
+
+    Column detection (IDENTIFIER_COLUMNS/TYPE_COLUMNS/ELIGIBLE_COLUMNS)
+    is tolerant across both platforms' formats; see the comments above
+    those constants for exactly what's confirmed vs. best-effort. Keeps
+    only recognized-web-asset-type rows that aren't explicitly marked
+    ineligible/out-of-scope (missing/blank eligibility column counts as
+    eligible — some exports omit it entirely, or only ever list in-scope
+    rows to begin with).
 
     Returns (hostname, is_wildcard) pairs, not bare hostnames — a
     "Closed Scope" program listing `corporate.abercrombie.com` as
     asset_type URL means exactly that host, NOT
     `staging.corporate.abercrombie.com` or any other subdomain; only an
-    explicit asset_type WILDCARD row (`*.example.com`) authorizes
-    suffix-matching. Losing this distinction (the pre-fix version
-    returned bare strings and every caller suffix-matched everything)
-    let Talon silently test/report on undiscovered-but-unauthorized
-    subdomains of any bare URL-type scope entry — confirmed in the
-    field: wafw00f fingerprinted staging.corporate.abercrombie.com
-    under a scope.csv that only ever listed the bare apex as URL."""
+    explicit WILDCARD-type row, or a bare identifier already written as
+    `*.example.com`, authorizes suffix-matching. Losing this distinction
+    (an earlier version returned bare strings and every caller
+    suffix-matched everything) let Talon silently test/report on
+    undiscovered-but-unauthorized subdomains of any bare URL-type scope
+    entry — confirmed in the field: wafw00f fingerprinted
+    staging.corporate.abercrombie.com under a scope.csv that only ever
+    listed the bare apex as URL."""
     with csv_path.open(newline="") as f:
         reader = csv.DictReader(f)
-        if not reader.fieldnames or "identifier" not in reader.fieldnames:
-            die(f"{csv_path} looks like a CSV but has no 'identifier' column — expected a HackerOne scope export")
+        fieldnames = reader.fieldnames or []
+        identifier_col = _first_present(fieldnames, IDENTIFIER_COLUMNS)
+        if identifier_col is None:
+            die(
+                f"{csv_path} looks like a CSV but has no recognizable identifier/target column "
+                f"(looked for {', '.join(IDENTIFIER_COLUMNS)}) — found: {', '.join(fieldnames) or '(empty header)'}. "
+                f"Expected a HackerOne or Bugcrowd scope export."
+            )
+        type_col = _first_present(fieldnames, TYPE_COLUMNS)
+        eligible_col = _first_present(fieldnames, ELIGIBLE_COLUMNS)
+
         domains = []
         skipped_non_web = 0
         for row in reader:
-            identifier = (row.get("identifier") or "").strip()
-            asset_type = (row.get("asset_type") or "").strip().upper()
-            eligible = (row.get("eligible_for_submission") or "true").strip().lower()
-            if not identifier or eligible == "false":
+            identifier = (row.get(identifier_col) or "").strip()
+            asset_type = (row.get(type_col) or "URL").strip().upper() if type_col else "URL"
+            eligible = (row.get(eligible_col) or "true").strip().lower() if eligible_col else "true"
+            if not identifier or eligible in ("false", "no", "0", "out", "out of scope"):
                 continue
-            if asset_type not in SCOPE_CSV_WEB_ASSET_TYPES:
+            is_wildcard = asset_type in SCOPE_CSV_WILDCARD_TYPES or identifier.lstrip().startswith("*.")
+            if asset_type not in SCOPE_CSV_WEB_ASSET_TYPES and not is_wildcard:
                 skipped_non_web += 1
                 continue
-            domains.append((_scope_csv_hostname(identifier), asset_type == "WILDCARD"))
+            domains.append((_scope_csv_hostname(identifier), is_wildcard))
     if skipped_non_web:
-        info(f"{skipped_non_web} non-web scope row(s) skipped (mobile apps, etc. — Talon only tests HTTP assets)")
+        info(f"{skipped_non_web} non-web scope row(s) skipped (mobile apps, source code, hardware, etc. — Talon only tests HTTP assets)")
     return sorted(set(domains))
 
 

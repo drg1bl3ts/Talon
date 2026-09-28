@@ -566,6 +566,45 @@ RECOMMENDATIONS = {
     "cookies": "Session cookie missing Secure/HttpOnly/SameSite=Strict. Not CSRF detection itself (that needs per-form token presence, which this pipeline doesn't parse for) — but missing SameSite is a CSRF-adjacent gap, and missing Secure/HttpOnly widen session-hijacking risk (MITM capture, XSS-driven cookie theft) if any XSS/mixed-content finding elsewhere in this report is real. Worth a line in the report even where it's not independently bounty-worthy.",
 }
 
+# Maps each candidate category to the Claude Code agent/skill best suited
+# to pick it up next — the machine-readable counterpart to
+# RECOMMENDATIONS above (which is prose for a human reading
+# RECOMMENDATIONS.md). Consumed by build_next_steps() to populate
+# talon_summary.json's "next_steps", which is what a Claude Code session
+# (or the talon-hunt skill) reads to decide what to dispatch, instead of
+# parsing prose out of the markdown report.
+#
+# Only categories with a genuinely confident agent match get one —
+# several deliberately map to agent=None (see "note") rather than force
+# a fit. Names must stay in sync with the actual agent list; there's no
+# runtime check that e.g. "ssrf-hunter" still exists as a subagent_type.
+CLASS_AGENT_MAP = {
+    "xss": {"agent": "web-hunter", "skill": "bypass-techniques", "note": "context-aware payloads nuclei's generic set doesn't try; bypass-techniques for WAF-filtered cases"},
+    "sqli": {"agent": "web-hunter", "skill": None, "note": "time/boolean-based blind + DB-specific syntax"},
+    "ssrf": {"agent": "ssrf-hunter", "skill": None, "note": "dedicated agent — hand it ssrf_candidates.txt and the sink-classified subset"},
+    "lfi": {"agent": "web-hunter", "skill": None, "note": "OS-specific encoding/wrapper tricks"},
+    "rce": {"agent": "exploit-guide", "skill": None, "note": "no generic nuclei signature exists for this class — always manual, OOB-verified"},
+    "ssti": {"agent": "web-hunter", "skill": None, "note": "engine fingerprint first, then engine-specific chain"},
+    "img_traversal": {"agent": "web-hunter", "skill": None, "note": "LFI variant via image-loading endpoints"},
+    "redirect": {"agent": "web-hunter", "skill": None, "note": "check OAuth redirect_uri abuse angle if any auth endpoints are in the candidate set"},
+    "idor": {"agent": "bizlogic-hunter", "skill": None, "note": "needs two authenticated identities to diff against — no generic signature exists"},
+    "interestingparams": {"agent": "web-hunter", "skill": None, "note": "shortlist, not one vuln class — fuzz by hand"},
+    "debug_logic": {"agent": "bizlogic-hunter", "skill": None, "note": "flag/value toggling, workflow-state class of bug"},
+    "nosqli": {"agent": "web-hunter", "skill": None, "note": "URL-shape candidate only — real test needs a JSON body, see RECOMMENDATIONS"},
+    "proto_pollution": {"agent": "web-hunter", "skill": None, "note": "URL-shape candidate only — real test needs a JSON body, see RECOMMENDATIONS"},
+    "interestingEXT_dangerous": {"agent": None, "skill": None, "note": "pull the file directly and inspect — no agent needed for a confirmed exposure"},
+    "js_secrets": {"agent": None, "skill": None, "note": "verify by hand (context for dummy/test keys) then report immediately if real — no agent needed"},
+    "takeover": {"agent": "subdomain-takeover", "skill": None, "note": "dedicated agent — deeper dangling-NS/MX/expired-domain analysis than nuclei's template-fingerprint-only check"},
+    "cors": {"agent": "api-security", "skill": None, "note": "check for Access-Control-Allow-Credentials pairing"},
+    "headers": {"agent": None, "skill": None, "note": "routine hardening — worth a clickjacking PoC only if a real state-changing action is reachable, see RECOMMENDATIONS"},
+    "hardening": {"agent": "ssrf-hunter", "skill": "bypass-techniques", "note": "XXE/cache-poisoning/host-header findings specifically — ssrf-hunter for XXE's OOB-callback verification, bypass-techniques for cache-poisoning payload construction"},
+    "graphql": {"agent": "graphql-hunter", "skill": None, "note": "dedicated agent — detection/misconfig only here, introspection/query-depth/batching abuse is its job"},
+    "smuggling": {"agent": None, "skill": "bypass-techniques", "note": "confirm manually before escalating — nuclei's differential probes are noisy"},
+    "cookies": {"agent": None, "skill": None, "note": "informational — feeds severity of any real XSS/session finding elsewhere in the run"},
+    "waf": {"agent": None, "skill": "bypass-techniques", "note": "vendor-specific bypass guidance, not a hunting target itself"},
+    "cms": {"agent": "vuln-scanner", "skill": None, "note": "CVE lookup against the detected name+version"},
+}
+
 
 def run_nuclei_with_progress(cmd: list, label: str) -> int:
     """Runs a nuclei command with -stats-json (stderr, JSONL) and feeds the
@@ -1815,16 +1854,92 @@ def write_recommendations_md(
     return out
 
 
+def build_next_steps(
+    triage_dir: Path, gf_counts: dict, dangerous_count: int, secret_findings: list,
+    takeover_findings: list, cors_findings: list, headers_findings: list, hardening_findings: list,
+    graphql_findings: list, smuggling_findings: list, cookie_findings: list,
+    ssrf_sink_hits: list, waf_findings: list, cms_by_host: dict,
+) -> list[dict]:
+    """The machine-readable counterpart to RECOMMENDATIONS.md's "Recommendations
+    by Class" section — one entry per category that actually has something
+    in it, each carrying enough for a Claude Code session to act on without
+    re-deriving it: which agent/skill (CLASS_AGENT_MAP), how many
+    candidates, and where the candidate file lives (relative to triage_dir,
+    so a consumer resolves it against wherever this run's results actually
+    are rather than a path baked in at scan time)."""
+    steps = []
+
+    def add(category: str, count: int, candidate_file: str | None):
+        if count <= 0:
+            return
+        m = CLASS_AGENT_MAP.get(category, {"agent": None, "skill": None, "note": ""})
+        steps.append({
+            "category": category, "count": count, "candidate_file": candidate_file,
+            "agent": m["agent"], "skill": m["skill"], "note": m["note"],
+        })
+
+    for cls in FUZZ_CLASSES + MANUAL_CLASSES:
+        add(cls["slug"], gf_counts.get(cls["slug"], 0), f"triage/{cls['slug']}_candidates.txt")
+    add("interestingEXT_dangerous", dangerous_count, "triage/interestingEXT_dangerous.txt")
+    add("js_secrets", len(secret_findings), "triage/js_secrets_urls.txt")
+    add("takeover", len(takeover_findings), "triage/takeover_urls.txt")
+    add("cors", len(cors_findings), "triage/nuclei/nuclei_cors.jsonl")
+    add("headers", len(headers_findings), "triage/nuclei/nuclei_headers.jsonl")
+    add("hardening", len(hardening_findings), "triage/nuclei/nuclei_hardening.jsonl")
+    add("graphql", len(graphql_findings), "triage/nuclei/nuclei_graphql.jsonl")
+    add("smuggling", len(smuggling_findings), "triage/nuclei/nuclei_smuggling.jsonl")
+    add("cookies", len(cookie_findings), "triage/nuclei/nuclei_cookies.jsonl")
+    add("waf", len(waf_findings), "triage/waf_detect.json")
+    add("cms", len(cms_by_host), "triage/cmseek/")
+
+    # ssrf_sink_hits is a HIGH-CONFIDENCE SUBSET of the "ssrf" entry already
+    # added above (via gf_counts), not a separate candidate pool — listed
+    # as its own entry so a consumer can prioritize it first without
+    # re-reading ssrf_candidates.txt and re-running classify_ssrf_sinks()
+    # itself.
+    if ssrf_sink_hits:
+        m = CLASS_AGENT_MAP["ssrf"]
+        steps.append({
+            "category": "ssrf_high_confidence", "count": len(ssrf_sink_hits),
+            "candidate_file": "triage/ssrf_candidates.txt", "agent": m["agent"], "skill": m["skill"],
+            "note": "known real-world sink shape, alive-host-confirmed, deduped — test these before the raw ssrf candidate list",
+        })
+    return steps
+
+
 def write_json_summary(
     triage_dir: Path, target: str, url_count: int, gf_counts: dict,
     ext_live_count: int, dangerous_count: int, js_count: int, secret_findings: list,
     findings: list, manual_count: int,
     has_prev_run: bool, new_findings: list, new_secrets: list, new_dangerous: list, new_manual: list,
     skipped_classes: list[str],
+    waf_findings: list | None = None, tech_by_host: dict | None = None, port_findings: list | None = None,
+    ssrf_sink_hits: list | None = None, cms_versions: dict | None = None, xmlrpc_findings: list | None = None,
+    cms_by_host: dict | None = None, vhost_hits: list | None = None, dirbrute_hits: list | None = None,
+    takeover_findings: list | None = None, cors_findings: list | None = None,
+    headers_findings: list | None = None, hardening_findings: list | None = None, graphql_findings: list | None = None,
+    smuggling_findings: list | None = None, cookie_findings: list | None = None,
 ) -> Path:
+    waf_findings = waf_findings or []
+    tech_by_host = tech_by_host or {}
+    port_findings = port_findings or []
+    ssrf_sink_hits = ssrf_sink_hits or []
+    cms_versions = cms_versions or {}
+    xmlrpc_findings = xmlrpc_findings or []
+    cms_by_host = cms_by_host or {}
+    vhost_hits = vhost_hits or []
+    dirbrute_hits = dirbrute_hits or []
+    takeover_findings = takeover_findings or []
+    cors_findings = cors_findings or []
+    headers_findings = headers_findings or []
+    hardening_findings = hardening_findings or []
+    graphql_findings = graphql_findings or []
+    smuggling_findings = smuggling_findings or []
+    cookie_findings = cookie_findings or []
+
     summary = {
         "tool": "talon",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "target": target,
         "phase": "vulnerability-discovery",
@@ -1837,6 +1952,34 @@ def write_json_summary(
         "js_secret_findings": secret_findings,
         "nuclei_findings": findings,
         "manual_review_count": manual_count,
+        # Everything RECOMMENDATIONS.md's Quick Reference block shows a
+        # human, structured for a program instead — this was previously
+        # ONLY in the markdown, despite the README's own claim that this
+        # file has "the same data, structured."
+        "quick_reference": {
+            "waf_findings": waf_findings,
+            "tech_by_host": tech_by_host,
+            "port_findings": port_findings,
+            "ssrf_high_confidence_sinks": ssrf_sink_hits,
+            "cms_by_host": cms_by_host,
+            "cms_versions": cms_versions,
+            "xmlrpc_findings": xmlrpc_findings,
+            "vhost_hits": vhost_hits,
+            "dirbrute_hits": dirbrute_hits,
+        },
+        "takeover_findings": takeover_findings,
+        "cors_findings": cors_findings,
+        "headers_findings": headers_findings,
+        "hardening_findings": hardening_findings,
+        "graphql_findings": graphql_findings,
+        "smuggling_findings": smuggling_findings,
+        "cookie_findings": cookie_findings,
+        "next_steps": build_next_steps(
+            triage_dir, gf_counts, dangerous_count, secret_findings,
+            takeover_findings, cors_findings, headers_findings, hardening_findings,
+            graphql_findings, smuggling_findings, cookie_findings,
+            ssrf_sink_hits, waf_findings, cms_by_host,
+        ),
         "new_since_last_run": {
             "has_previous_run": has_prev_run,
             "nuclei_findings": new_findings,
@@ -2242,6 +2385,11 @@ def main():
         js_count, secret_findings, findings, manual_count,
         prev_state is not None, new_findings, new_secrets, new_dangerous, new_manual,
         skipped_classes,
+        waf_findings, tech_by_host, port_findings, ssrf_sink_hits, cms_versions, xmlrpc_findings,
+        cms_by_host, vhost_hits, dirbrute_hits,
+        takeover_findings, cors_findings,
+        headers_findings, hardening_findings, graphql_findings,
+        smuggling_findings, cookie_findings,
     )
 
     if args.discord:

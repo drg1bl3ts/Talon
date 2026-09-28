@@ -92,11 +92,11 @@ The installer sets up everything: Go, the recon toolchain (subfinder/httpx/dnsx/
 | Flag | Description |
 | --- | --- |
 | `-t, --target` | Single target domain |
-| `-l, --list` | File with one domain per line (multi-target), or a HackerOne scope CSV export (`.csv` extension) |
+| `-l, --list` | File with one domain per line (multi-target), or a HackerOne/Bugcrowd scope CSV export (`.csv` extension) |
 | `--skip-recon` | Reuse an existing results dir instead of running Talon's own recon pipeline again |
 | `--indir` | Point at a custom output dir (default: `results/<target>` for `-t`, `results/<list-file's-directory-name>` for `-l`, or `$OUTDIR`) |
 | `--param-jobs` | Parallel paramspider workers during recon (default: 5) |
-| `--scope-file` | One in-scope domain per line (apex or `*.sub.domain`), or a HackerOne scope CSV export (`.csv` extension). Filters `all_urls.txt` and `fresh_alive_domains` before anything downstream touches them |
+| `--scope-file` | One in-scope domain per line (apex or `*.sub.domain`), or a HackerOne/Bugcrowd scope CSV export (`.csv` extension). Filters `all_urls.txt` and `fresh_alive_domains` before anything downstream touches them |
 | `--rate` | nuclei/httpx `-rate-limit` (default: 50 — this is live production infrastructure, not a lab box) |
 | `-H, --header` | Custom header added to every live HTTP request Talon makes — recon (httpx/katana), triage (httpx/nuclei), and the proxy warm-up (curl). Repeatable, e.g. `-H 'X-HackerOne-Researcher: yourname'` |
 | `--proxy` | `caido` or `burp` — routes the manual-review queue through that tool's warm-up (`curl -x http://127.0.0.1:8080`; both tools default to that same address, so there's no separate address flag) and picks the wording used in progress messages and `RECOMMENDATIONS.md` (Caido Replay/Sitemap vs. Burp Repeater/HTTP history). Omit to skip the warm-up entirely (default). Note `curl` is still required by default regardless — see `--no-cms-probe` |
@@ -168,15 +168,15 @@ EOF
 talon -t example.com --scope-file scope.txt
 ```
 
-Or point it straight at a HackerOne scope export (Program page → Scope → Download CSV) — mobile app store entries are skipped automatically since Talon only tests HTTP assets:
+Or point it straight at a HackerOne (Program page → Scope → Download CSV) or Bugcrowd (Program page → Scope → Export CSV) scope export — mobile app store entries and other non-web asset types are skipped automatically since Talon only tests HTTP assets. Column-name detection is tolerant across both platforms' export formats (see `parse_scope_csv()` in `talon_common.py` for exactly which columns it looks for); if your export doesn't parse, Talon fails loudly with the actual header row it found rather than silently producing an empty or wrong scope:
 
 ```bash
 talon -t example.com --scope-file scope_export.csv
 ```
 
-### Run against a raw HackerOne scope export, no hand-built domain list
+### Run against a raw scope export, no hand-built domain list
 
-`-l` accepts a scope CSV directly (same parsing `--scope-file` uses), so the export doubles as both the recon target list and the downstream scope filter — no risk of the two drifting out of sync:
+`-l` accepts a HackerOne or Bugcrowd scope CSV directly (same parsing `--scope-file` uses), so the export doubles as both the recon target list and the downstream scope filter — no risk of the two drifting out of sync:
 
 ```bash
 talon -l scope_export.csv --scope-file scope_export.csv
@@ -235,7 +235,7 @@ And in `results/<target>/triage/`:
 | `manual_review.txt` | Deduped queue of everything nuclei can't fingerprint on its own |
 | `talon_state.json` | Snapshot of this run's findings, used to compute the "New Since Last Run" diff on the next run |
 | `RECOMMENDATIONS.md` | Human-readable report — leads with a Quick Reference block (WAF/CDN, tech stack, ports of interest, SSRF signal-vs-noise), then new-since-last-run, counts, nuclei findings table, and dedicated per-vuln-class guidance worded for Caido or Burp Suite (`--proxy`), plus takeover and CORS findings (only sections with actual findings are shown) |
-| `talon_summary.json` | The same data, structured, for chaining into other tooling |
+| `talon_summary.json` | The same data as RECOMMENDATIONS.md, structured — every finding list, the full Quick Reference block, and a `next_steps` manifest (one entry per category with actual candidates: count, candidate-file path, and the suggested Claude Code agent/skill from `CLASS_AGENT_MAP`) for chaining into other tooling instead of parsing the markdown report |
 
 ---
 
