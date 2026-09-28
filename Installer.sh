@@ -777,6 +777,74 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────
+# TALON-AUTHORED GF PATTERNS
+# (nosqli/proto-pollution — 1ndianl33t/Gf-Patterns doesn't ship either;
+# these are Talon's own, so unlike the clone above they're always
+# (re)written to stay in sync with whatever talon.py expects, not just
+# written once. Talon's MANUAL_CLASSES docstring for these two explains
+# why they route to the manual queue rather than nuclei auto-fuzzing:
+# no generic nuclei signature exists for either class, and both real
+# bug classes are normally triggered via a POST body key, not the URL
+# these patterns match against — they identify candidate endpoints
+# worth a hand-tested body payload, not confirmed hits.)
+# ──────────────────────────────────────────────────────────────
+
+info "Writing Talon's own GF patterns (nosqli, proto-pollution)..."
+mkdir -p "$GF_DIR"
+
+cat > "${GF_DIR}/nosqli.json" <<'GFEOF'
+{
+    "flags": "-iE",
+     "patterns": [
+
+        "username=",
+        "password=",
+        "passwd=",
+        "login=",
+        "email=",
+        "search=",
+        "query=",
+        "filter=",
+        "sort=",
+        "sortby=",
+        "orderby=",
+        "where=",
+        "find=",
+        "lookup=",
+        "\\$where",
+        "\\$ne",
+        "\\$regex",
+        "\\$gt",
+        "\\$lt",
+        "\\$in",
+        "\\$or",
+        "\\$exists"
+]
+}
+GFEOF
+
+cat > "${GF_DIR}/proto-pollution.json" <<'GFEOF'
+{
+    "flags": "-iE",
+     "patterns": [
+
+        "__proto__",
+        "constructor(\\[|%5[bB])prototype",
+        "constructor\\.prototype",
+        "prototype(\\[|%5[bB])",
+        "merge=",
+        "extend=",
+        "assign=",
+        "settings=",
+        "options=",
+        "update="
+]
+}
+GFEOF
+
+ok "GF patterns nosqli.json / proto-pollution.json written to ${GF_DIR}"
+
+# ──────────────────────────────────────────────────────────────
 # CMSEEK
 # (optional — talon.py's detect_cms_names() checks for
 # ~/Tools/CMSeeK/cmseek.py itself and simply skips CMS detection if it's

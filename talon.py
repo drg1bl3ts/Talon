@@ -101,6 +101,24 @@ MANUAL_CLASSES = [
     {"slug": "interestingparams", "pattern": "interestingparams"},
     {"slug": "debug_logic", "pattern": "debug_logic"},
     {"slug": "rce", "pattern": "rce"},
+    # nosqli/proto_pollution: same "no generic nuclei signature" situation
+    # as rce, for a different reason — nuclei-templates ships zero generic
+    # (non-CVE-specific) templates for either class at all (checked
+    # directly: `grep -rl tags:.*nosql http/fuzzing/
+    # http/vulnerabilities/generic/` and the equivalent for prototype
+    # pollution both come back empty; every NoSQLi/proto-pollution
+    # template in the repo is a product-specific CVE check). The GF
+    # patterns here (Installer.sh writes nosqli.json/proto-pollution.json
+    # — neither exists in the upstream Gf-Patterns set) are also
+    # necessarily weaker signal than the rest: Talon's candidates come
+    # from crawled/historical URLs (query strings), but both bug classes
+    # are usually triggered via POST body keys ($where/$ne/__proto__ as
+    # JSON fields), which nothing in this pipeline ever sees. These
+    # buckets exist to surface auth/search/filter/merge/config-shaped
+    # endpoints worth hand-testing with a body-based payload, not to
+    # claim URL-based detection of either class.
+    {"slug": "nosqli", "pattern": "nosqli"},
+    {"slug": "proto_pollution", "pattern": "proto-pollution"},
 ]
 
 # The exposure *is* the file existing — checked with httpx, not nuclei.
@@ -535,6 +553,8 @@ RECOMMENDATIONS = {
     "idor": "No generic signature exists for broken access control. {replay}: swap the session/auth token between two authenticated identities on the same object id, diff the responses.",
     "interestingparams": "Not one specific vuln class — a shortlist worth a closer look. Send to {replay} and fuzz each param by hand (or {fuzzer}).",
     "debug_logic": "Manual — toggle the flag/value (debug=1, admin=true, test=1, verbose=true) via {replay} and watch for behavior or response changes.",
+    "nosqli": "URL-based match only (auth/search/filter/sort-shaped param on this endpoint) — no generic nuclei signature exists for NoSQLi, and real NoSQL operator injection ($ne/$gt/$regex/$where) almost always lands in a POST body, not the query string. In {replay}, switch the request to JSON and try operator-shaped values in place of the normal literal (e.g. `\"password\": {{\"$ne\": null}}` against a login endpoint) — a login bypass or altered result set is the confirmation signal.",
+    "proto_pollution": "URL-based match only (literal `__proto__`/`constructor[prototype]`-shaped param, or a merge/clone/extend/config-shaped param name) — real prototype pollution is normally triggered via a JSON body key, not the query string. In {replay}, try `__proto__`/`constructor.prototype` as a body key against any endpoint that merges/extends user input into an object, then check for the polluted property showing up somewhere else in the app (a different endpoint's response, a changed default, a DoS via an unexpected property).",
     "interestingEXT_dangerous": "CONFIRMED live AND matched a high-risk extension (git/env/sql/backup/config/key/etc.). Pull the file directly and inspect for leaked source, credentials, or config. Everything else in interestingEXT_live.txt is presumed public (PDFs/docs/assets) and wasn't queued.",
     "js_secrets": "Regex-matched a known secret format inside live JS source. Verify by hand first — check surrounding context for dummy/example/test keys before trusting it. If it's real: confirm scope (is it actually active?) and report immediately — a live credential in client-side JS is often a direct account or API compromise.",
     "takeover": "Nuclei matched a dangling-CNAME fingerprint (the platform's 'no such app'/'NoSuchBucket'-style error page). Verify manually before claiming: confirm the CNAME still points at the deprovisioned resource, then actually claim/register the resource yourself if the platform allows it — a fingerprint match without a successful claim isn't a confirmed takeover.",
@@ -542,6 +562,8 @@ RECOMMENDATIONS = {
     "headers": "Missing security header(s) (HSTS, CSP, X-Frame-Options, etc.) — mostly low/no bounty value on their own, but a missing X-Frame-Options/frame-ancestors is worth a quick clickjacking PoC (an iframe embed + an overlaid decoy button) if the page has a real state-changing action reachable without re-auth.",
     "hardening": "Generic probes for blind XXE, CRLF injection, cache poisoning, and Host-header injection — all prone to false positives on generic response-based matchers. Verify each in {replay} by hand: for XXE, confirm actual out-of-band interaction; for cache poisoning, confirm the poisoned response is actually served back to a second, unheadered request.",
     "graphql": "GraphQL endpoint and/or a dev-tool exposure (GraphiQL/Playground/Voyager) or misconfig (alias/array batching, GET-method bypass, field-suggestion leak) flagged. This is detection/misconfig only — hand off to the `graphql-hunter` agent for actual introspection, query-depth/batching abuse, and authorization testing.",
+    "smuggling": "Nuclei's differential CL.TE/TE.CL probes flagged a timing/response discrepancy consistent with HTTP request smuggling — high-impact if real, but these probes are inherently noisy (load balancers, WAFs, and some CDNs produce the same signal without being exploitable). Confirm manually before trusting it: replay the same differential request a few times for consistency, then escalate to a dedicated smuggling workflow (queue desync via a second, victim-simulating request) rather than relying on nuclei's single-shot result alone.",
+    "cookies": "Session cookie missing Secure/HttpOnly/SameSite=Strict. Not CSRF detection itself (that needs per-form token presence, which this pipeline doesn't parse for) — but missing SameSite is a CSRF-adjacent gap, and missing Secure/HttpOnly widen session-hijacking risk (MITM capture, XSS-driven cookie theft) if any XSS/mixed-content finding elsewhere in this report is real. Worth a line in the report even where it's not independently bounty-worthy.",
 }
 
 
@@ -941,6 +963,58 @@ def nuclei_graphql_scan(alive: Path, nuclei_dir: Path, rate: int, headers: list[
     returncode = run_nuclei_with_progress(cmd, "nuclei:graphql")
     if returncode != 0:
         warn(f"nuclei GraphQL pass exited {returncode}")
+    return out if out.exists() else None
+
+
+# The only two generic (non-CVE-specific) request-smuggling templates
+# nuclei-templates ships — verified via `nuclei -tags smuggling -t
+# http/vulnerabilities/smuggling/ -tl`, exactly these two files, nothing
+# else in that folder.
+SMUGGLING_TEMPLATES = "http/vulnerabilities/smuggling/"
+
+
+def nuclei_smuggling_scan(alive: Path, nuclei_dir: Path, rate: int, headers: list[str] | None = None) -> Path | None:
+    out = nuclei_dir / "nuclei_smuggling.jsonl"
+    cmd = [
+        "nuclei", "-silent", "-l", str(alive), "-tags", "smuggling",
+        "-t", SMUGGLING_TEMPLATES,
+        "-etags", "dos", "-rate-limit", str(rate), "-jsonl", "-o", str(out),
+    ] + header_args(headers) + NUCLEI_STATS_FLAGS
+    returncode = run_nuclei_with_progress(cmd, "nuclei:smuggling")
+    if returncode != 0:
+        warn(f"nuclei smuggling pass exited {returncode}")
+    return out if out.exists() else None
+
+
+# Explicit file list, not a folder+tag scope like HARDENING_TAGS/
+# GRAPHQL_TEMPLATES: `-tags cookie` scoped to the whole
+# http/misconfiguration/ folder also pulls in wp-cookie-law-info-fpd.yaml
+# (a WordPress plugin path-disclosure check, unrelated to session-cookie
+# security) — confirmed via `nuclei -tags cookie -t
+# http/misconfiguration/ -tl`. Pinning exact files keeps this pass
+# actually scoped to what RECOMMENDATIONS["cookies"] claims it does.
+COOKIE_TEMPLATES = (
+    "http/misconfiguration/missing-cookie-samesite-strict.yaml,"
+    "http/misconfiguration/cookies-without-httponly.yaml,"
+    "http/misconfiguration/cookies-without-secure.yaml"
+)
+
+
+def nuclei_cookie_scan(alive: Path, nuclei_dir: Path, rate: int, headers: list[str] | None = None) -> Path | None:
+    """Session-cookie hardening (SameSite/HttpOnly/Secure) — CSRF-adjacent,
+    not CSRF detection itself. A real CSRF check needs to fetch pages and
+    parse forms for anti-CSRF token presence, which nothing in this
+    pipeline does (Talon shells out to real tools rather than
+    reimplementing an HTML parser); missing SameSite is the one piece of
+    that picture nuclei can flag from response headers alone."""
+    out = nuclei_dir / "nuclei_cookies.jsonl"
+    cmd = [
+        "nuclei", "-silent", "-l", str(alive), "-t", COOKIE_TEMPLATES,
+        "-etags", "dos", "-rate-limit", str(rate), "-jsonl", "-o", str(out),
+    ] + header_args(headers) + NUCLEI_STATS_FLAGS
+    returncode = run_nuclei_with_progress(cmd, "nuclei:cookies")
+    if returncode != 0:
+        warn(f"nuclei cookie-security pass exited {returncode}")
     return out if out.exists() else None
 
 
@@ -1599,6 +1673,7 @@ def write_recommendations_md(
     ssrf_sink_hits: list | None = None, cms_versions: dict | None = None, xmlrpc_findings: list | None = None,
     cms_by_host: dict | None = None, vhost_hits: list | None = None, dirbrute_hits: list | None = None,
     headers_findings: list | None = None, hardening_findings: list | None = None, graphql_findings: list | None = None,
+    smuggling_findings: list | None = None, cookie_findings: list | None = None,
 ) -> Path:
     sev = severity_breakdown(findings)
     lines = []
@@ -1722,6 +1797,18 @@ def write_recommendations_md(
         lines.append(RECOMMENDATIONS["graphql"].format(**terms))
         for f in graphql_findings:
             lines.append(f"- {f['template_id']} — {f['matched_at']}")
+    smuggling_findings = smuggling_findings or []
+    if smuggling_findings:
+        lines.append(f"\n### smuggling ({len(smuggling_findings)} finding{'s' if len(smuggling_findings) != 1 else ''})")
+        lines.append(RECOMMENDATIONS["smuggling"].format(**terms))
+        for f in smuggling_findings:
+            lines.append(f"- {f['template_id']} — {f['matched_at']}")
+    cookie_findings = cookie_findings or []
+    if cookie_findings:
+        lines.append(f"\n### cookies ({len(cookie_findings)} finding{'s' if len(cookie_findings) != 1 else ''})")
+        lines.append(RECOMMENDATIONS["cookies"].format(**terms))
+        for f in cookie_findings:
+            lines.append(f"- {f['name']} — {f['matched_at']}")
 
     out = triage_dir / "RECOMMENDATIONS.md"
     out.write_text("\n".join(lines) + "\n")
@@ -2066,9 +2153,16 @@ def main():
     hardening_findings = parse_nuclei_jsonl([hardening_out] if hardening_out else [])
     graphql_out = nuclei_graphql_scan(alive_path, nuclei_dir, args.rate, args.headers)
     graphql_findings = parse_nuclei_jsonl([graphql_out] if graphql_out else [])
+    smuggling_out = nuclei_smuggling_scan(alive_path, nuclei_dir, args.rate, args.headers)
+    smuggling_findings = parse_nuclei_jsonl([smuggling_out] if smuggling_out else [])
+    cookie_out = nuclei_cookie_scan(alive_path, nuclei_dir, args.rate, args.headers)
+    cookie_findings = parse_nuclei_jsonl([cookie_out] if cookie_out else [])
     class_outs = nuclei_class_scans(triage_dir, nuclei_dir, args.rate, active_fuzz_classes, args.headers, args.max_candidates)
     all_paths = ([host_out] if host_out else []) + [p for _, p in class_outs]
-    findings = parse_nuclei_jsonl(all_paths) + cors_findings + headers_findings + hardening_findings + graphql_findings
+    findings = (
+        parse_nuclei_jsonl(all_paths) + cors_findings + headers_findings + hardening_findings
+        + graphql_findings + smuggling_findings + cookie_findings
+    )
     success(f"nuclei complete — {len(findings)} finding(s)")
 
     phase("SUBDOMAIN TAKEOVER CHECK")
@@ -2141,6 +2235,7 @@ def main():
         waf_findings, tech_by_host, port_findings, ssrf_sink_hits, cms_versions, xmlrpc_findings,
         cms_by_host, vhost_hits, dirbrute_hits,
         headers_findings, hardening_findings, graphql_findings,
+        smuggling_findings, cookie_findings,
     )
     json_path = write_json_summary(
         triage_dir, target_label, url_count, gf_counts, ext_live_count, dangerous_count,
