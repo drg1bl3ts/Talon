@@ -19,7 +19,7 @@ It calls the underlying recon tools (subfinder, httpx, dnsx, naabu, katana, asse
 - **Port/service triage** — labels naabu's discovered ports by likely service and cross-references them against every vuln-class candidate, confirmed with a scoped nuclei `-pt tcp` pass rather than just guessed by port number (skip the nuclei confirmation with `--no-port-triage`)
 - **CMS fingerprint** (optional — [CMSeeK](https://github.com/Tuhinshubhra/CMSeeK)) — detects CMS name per alive host, extracts version numbers where a reliable technique exists (WordPress, Drupal, Joomla), and checks `xmlrpc.php`/`pingback.ping` exposure on WordPress hosts as an SSRF primitive (skip the live xmlrpc check with `--no-cms-probe`). Degrades gracefully — CMS detection simply doesn't run if CMSeeK isn't installed
 - **Live-exposure check** with high-risk extension filtering (`.git`, `.env`, `.sql`, `.bak`, etc. — separated from ordinary public files)
-- **JS secret scan** — fetches every `.js` URL via httpx's native `-extract-regex` (no hand-rolled curl loop) and checks it against known secret formats (AWS/Google/Stripe/Slack/GitHub keys, JWTs, private key blocks, generic `api_key=` assignments)
+- **JS secret scan** — fetches every `.js` URL's raw response via httpx (`-sr`) and scans it with [trufflehog](https://github.com/trufflesecurity/trufflehog) (`filesystem` mode — ~800 maintained detectors, not a hand-rolled pattern list). Live verification is **on by default**: a real API call to the matched service (AWS/Slack/Stripe/GitHub/etc.) confirms whether the credential currently authenticates, not just that it's shaped like one — confirmed hits are flagged separately and need no further manual check on the liveness question. `--no-secret-verify` disables verification (detection still runs) for a program that restricts using a found credential even to confirm it, or to skip the outbound third-party calls entirely
 - **nuclei** — a host-level `severity:critical` sweep, a dedicated CORS misconfig pass, a security-headers/clickjacking pass, a hardening pass (blind XXE, CRLF injection, cache poisoning, Host-header injection), a GraphQL detection + misconfig pass (exposed GraphiQL/Playground/Voyager, batching/GET-method bypass, field-suggestion leak — hands off to the `graphql-hunter` agent for actual exploitation), an HTTP request-smuggling pass (CL.TE/TE.CL differential probes — noisy, confirm manually), a session-cookie hardening pass (missing Secure/HttpOnly/SameSite — CSRF-adjacent, not full CSRF-token detection, which would need form/body parsing this pipeline doesn't do), a per-class pass scoped to generic parameter-injection templates (not every CVE template with that tag — measured 67x fewer requests than unrestricted tag matching, same real coverage), and a subdomain-takeover pass (73 templates). All of the above reuse templates already inside the nuclei-templates checkout the installer pre-fetches — no extra tool or download. DoS-tagged templates are always excluded via `-etags dos`, since most programs prohibit DoS testing
 - **Vhost fuzzing** *(opt-in, `--vhost-fuzz`)* — Host-header fuzzing via `ffuf` against SecLists' DNS wordlist, one apex per representative host. OFF by default: thousands of requests per apex, higher volume than anything else in the pipeline, and aggressive WAFs will rate-limit-block over it
 - **Directory bruteforce** *(opt-in, `--dir-brute`)* — recursive content discovery via `feroxbuster` against SecLists' common wordlist, per alive/in-scope host, depth-limited. Same volume/WAF caveat as `--vhost-fuzz`
@@ -51,9 +51,9 @@ recon.py — subdomains → alive → DNS → ports → crawl+waymore → params
              nuclei (auto)  manual-only     *.js URLs
              xss/sqli/ssrf/     idor            │
              lfi/rce/ssti/ interestingparams    ▼
-             redirect/     debug_logic    httpx -extract-regex
-             img-traversal   (SSRF sink     (AWS/Google/Stripe/
-                              classifier)    Slack/GitHub/JWT/…)
+             redirect/     debug_logic    httpx -sr → trufflehog
+             img-traversal   (SSRF sink     (~800 detectors,
+                              classifier)    live verification)
                     │             │             │
         fresh_alive_domains ──→ nuclei: CORS + headers + hardening +
                     │             │       graphql + smuggling + cookies +
@@ -81,9 +81,9 @@ recon.py — subdomains → alive → DNS → ports → crawl+waymore → params
 chmod +x Installer.sh && ./Installer.sh
 ```
 
-The installer sets up everything: Go, the recon toolchain (subfinder/httpx/dnsx/naabu/katana/assetfinder/anew/subfaster/findomain), the triage toolchain (gf/nuclei/notify/ffuf/feroxbuster), the Python side (waymore/paramspider/wafw00f, via a dedicated venv at `~/.talon-venv`), and two best-effort optional extras that Talon degrades gracefully without: CMSeeK (cloned to `~/Tools/CMSeeK`, powers CMS fingerprinting) and SecLists (installed via your package manager where available, powers `--vhost-fuzz`/`--dir-brute`).
+The installer sets up everything: Go, the recon toolchain (subfinder/httpx/dnsx/naabu/katana/assetfinder/anew/subfaster/findomain), the triage toolchain (gf/nuclei/notify/ffuf/feroxbuster/trufflehog), the Python side (waymore/paramspider/wafw00f, via a dedicated venv at `~/.talon-venv`), and two best-effort optional extras that Talon degrades gracefully without: CMSeeK (cloned to `~/Tools/CMSeeK`, powers CMS fingerprinting) and SecLists (installed via your package manager where available, powers `--vhost-fuzz`/`--dir-brute`).
 
-`wafw00f` is the one dependency here that isn't optional — Talon runs WAF/CDN detection by default (`--no-waf-detect` to skip), so a run will refuse to start without it on `PATH`.
+`wafw00f` and `trufflehog` are the two dependencies here that aren't optional — Talon runs WAF/CDN detection and the JS secret scan by default (`--no-waf-detect` / `--no-js-scan` to skip either), so a run will refuse to start without both on `PATH`.
 
 ---
 
@@ -104,7 +104,8 @@ The installer sets up everything: Go, the recon toolchain (subfinder/httpx/dnsx/
 | `--proxy-delay` | Delay between proxy warm-up requests, seconds (default: derived from `--rate`, so the warm-up never exceeds the same requests/sec ceiling as everything else) |
 | `--xss`, `--sqli`, `--ssrf`, `--lfi`, `--ssti`, `--img-traversal`, `--redirect`, `--idor`, `--interestingparams`, `--debug-logic`, `--rce`, `--nosqli`, `--proto-pollution` | Opt-in vulnerability-class filter. With none set, every class is triaged (default). Set one or more to restrict gf triage + nuclei fuzzing + the manual queue to just those classes — recon itself is unaffected |
 | `--max-candidates` | Cap each fuzz class's deduped candidate list to this many (random sample) before nuclei scans it — bounds worst-case runtime on a URL-rich target (default: unlimited) |
-| `--no-js-scan` | Skip fetching `.js` files and scanning them for hardcoded secrets |
+| `--no-js-scan` | Skip fetching `.js` files and scanning them for hardcoded secrets — also drops the `trufflehog` requirement, since that's its only caller |
+| `--no-secret-verify` | Skip trufflehog's live verification (real API calls confirming whether a found credential currently authenticates). Secrets are still detected, just not confirmed live. On by default |
 | `--no-host-scan` | Skip the all-host `severity:critical` CVE/misconfig sweep — the expensive one (roughly 1,870 templates times every alive host, hours on a large target). CORS, takeover, and per-class fuzzing passes still run and are the faster, higher-signal ones anyway |
 | `--no-waf-detect` | Skip the `wafw00f` WAF/CDN detection pass (one representative host per apex domain) — also drops `wafw00f` from the required-tools check |
 | `--no-port-triage` | Skip the nuclei `-pt tcp` confirmation pass for naabu-discovered ports — the static port→service labeling and Quick Reference cross-referencing still run |
@@ -224,7 +225,8 @@ And in `results/<target>/triage/`:
 | `interestingEXT_live.txt` | Candidates from `interestingEXT` confirmed live (HTTP 200) |
 | `interestingEXT_dangerous.txt` | The subset of those that matched a high-risk extension (git/env/sql/backup/config/key/etc.) — everything else is presumed public |
 | `js_urls.txt` | Every `.js` URL pulled out of `all_urls.txt` |
-| `js_secrets.jsonl` / `js_secrets.txt` | Regex hits from the JS secret scan (type, URL, matched string) |
+| `js_secrets.jsonl` / `js_secrets.txt` | trufflehog hits from the JS secret scan (type, URL, matched string, verified true/false) |
+| `js_secrets_verified.txt` | The subset CONFIRMED LIVE by trufflehog's own API call — no further verification needed, straight to reporting |
 | `js_secrets_urls.txt` | Just the JS URLs that had a hit — feeds `manual_review.txt` |
 | `waf_detect.json` | wafw00f results per apex domain (WAF/CDN vendor, if detected) |
 | `cmseek/<host>.json` | CMSeeK's raw per-host result, copied out of CMSeeK's own result tree (only written if CMSeeK is installed and detects something) |
@@ -244,7 +246,7 @@ And in `results/<target>/triage/`:
 Talon shells out to:
 
 **Recon** — subfinder, httpx, dnsx, naabu, katana, assetfinder, findomain, subfaster, waymore, paramspider, anew
-**Triage** — gf (needs `~/.gf` populated, see below), nuclei, httpx, anew, wafw00f, and curl (required unless both `--proxy` is unset and `--no-cms-probe` is passed — it's called by the proxy warm-up and by the WordPress `xmlrpc.php` check, so it's on by default)
+**Triage** — gf (needs `~/.gf` populated, see below), nuclei, httpx, anew, wafw00f, trufflehog (required unless `--no-js-scan`), and curl (required unless both `--proxy` is unset and `--no-cms-probe` is passed — it's called by the proxy warm-up and by the WordPress `xmlrpc.php` check, so it's on by default)
 **Opt-in** — ffuf (`--vhost-fuzz`), feroxbuster (`--dir-brute`) — both require SecLists' wordlists too
 **Optional, degrades gracefully** — CMSeeK (CMS fingerprinting simply doesn't run if it's not found at `~/Tools/CMSeeK`)
 **Optional** — notify (only used with `--discord`)

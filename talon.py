@@ -137,23 +137,14 @@ DANGEROUS_EXT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# High-confidence secret formats to hunt for inside JS file bodies. Kept
-# narrow and well-known (vs. gf's generic jsvar, which just matches any
-# `var x = "..."` and is mostly noise) — these are the same shapes
-# gitleaks/trufflehog key off of.
-SECRET_PATTERNS = [
-    ("aws_access_key_id", r"AKIA[0-9A-Z]{16}"),
-    ("google_api_key", r"AIza[0-9A-Za-z\-_]{35}"),
-    ("google_oauth_client_id", r"[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com"),
-    ("stripe_live_key", r"sk_live_[0-9a-zA-Z]{24,}"),
-    ("slack_token", r"xox[baprs]-[0-9A-Za-z-]{10,}"),
-    ("slack_webhook", r"hooks\.slack\.com/services/T[0-9A-Za-z]{8,}/B[0-9A-Za-z]{8,}/[0-9A-Za-z]{24}"),
-    ("github_token", r"gh[pousr]_[A-Za-z0-9]{36,}"),
-    ("jwt", r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
-    ("generic_api_key_assignment", r"(?i)(?:api[_-]?key|apikey|secret[_-]?key|access[_-]?token|auth[_-]?token)[\"']?\s*[:=]\s*[\"'][0-9A-Za-z\-_]{16,}[\"']"),
-    ("private_key_block", r"-----BEGIN (?:RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----"),
-]
-SECRET_PATTERN_NAMES = {pattern: name for name, pattern in SECRET_PATTERNS}
+# JS secret scanning shells out to trufflehog (see trufflehog_secret_scan()
+# below) rather than a hand-rolled pattern list — ~800 maintained detectors
+# instead of ~15, plus live verification (an actual API call confirming
+# whether a found credential currently authenticates, not just "shaped
+# like one"). Talon previously carried its own SECRET_PATTERNS regex list
+# here; removed in favor of the real tool rather than kept as a fallback,
+# consistent with Talon's own "shell out to real tools, don't reimplement"
+# rule everywhere else (wafw00f, CMSeeK, ffuf, feroxbuster).
 
 # Same port -> service/module mapping as the SSRFmap "finding -> next module"
 # quick reference in the SSRF Obsidian note — this is the static, free first
@@ -556,7 +547,7 @@ RECOMMENDATIONS = {
     "nosqli": "URL-based match only (auth/search/filter/sort-shaped param on this endpoint) — no generic nuclei signature exists for NoSQLi, and real NoSQL operator injection ($ne/$gt/$regex/$where) almost always lands in a POST body, not the query string. In {replay}, switch the request to JSON and try operator-shaped values in place of the normal literal (e.g. `\"password\": {{\"$ne\": null}}` against a login endpoint) — a login bypass or altered result set is the confirmation signal.",
     "proto_pollution": "URL-based match only (literal `__proto__`/`constructor[prototype]`-shaped param, or a merge/clone/extend/config-shaped param name) — real prototype pollution is normally triggered via a JSON body key, not the query string. In {replay}, try `__proto__`/`constructor.prototype` as a body key against any endpoint that merges/extends user input into an object, then check for the polluted property showing up somewhere else in the app (a different endpoint's response, a changed default, a DoS via an unexpected property).",
     "interestingEXT_dangerous": "CONFIRMED live AND matched a high-risk extension (git/env/sql/backup/config/key/etc.). Pull the file directly and inspect for leaked source, credentials, or config. Everything else in interestingEXT_live.txt is presumed public (PDFs/docs/assets) and wasn't queued.",
-    "js_secrets": "Regex-matched a known secret format inside live JS source. Verify by hand first — check surrounding context for dummy/example/test keys before trusting it. If it's real: confirm scope (is it actually active?) and report immediately — a live credential in client-side JS is often a direct account or API compromise.",
+    "js_secrets": "Found via trufflehog against live JS source (~800 detectors, not a hand-rolled pattern list). Entries marked VERIFIED were confirmed live by an actual API call to the matched service (AWS/Slack/Stripe/GitHub/etc.) — treat those as a real, active compromise and report immediately, no further manual check needed on the liveness question itself. Unverified entries still need the old discipline: check surrounding context for dummy/example/test keys before trusting it — a detector match confirms shape, not activity, when verification didn't run or came back inconclusive.",
     "takeover": "Nuclei matched a dangling-CNAME fingerprint (the platform's 'no such app'/'NoSuchBucket'-style error page). Verify manually before claiming: confirm the CNAME still points at the deprovisioned resource, then actually claim/register the resource yourself if the platform allows it — a fingerprint match without a successful claim isn't a confirmed takeover.",
     "cors": "Nuclei flagged a reflected/wildcard Access-Control-Allow-Origin. Check in {name} whether it's paired with Access-Control-Allow-Credentials: true (that combination is what actually enables cross-origin credentialed reads) — a permissive CORS header alone on a public endpoint often isn't exploitable.",
     "headers": "Missing security header(s) (HSTS, CSP, X-Frame-Options, etc.) — mostly low/no bounty value on their own, but a missing X-Frame-Options/frame-ancestors is worth a quick clickjacking PoC (an iframe embed + an overlaid decoy button) if the page has a real state-changing action reachable without re-auth.",
@@ -593,7 +584,8 @@ CLASS_AGENT_MAP = {
     "nosqli": {"agent": "web-hunter", "skill": None, "note": "URL-shape candidate only — real test needs a JSON body, see RECOMMENDATIONS"},
     "proto_pollution": {"agent": "web-hunter", "skill": None, "note": "URL-shape candidate only — real test needs a JSON body, see RECOMMENDATIONS"},
     "interestingEXT_dangerous": {"agent": None, "skill": None, "note": "pull the file directly and inspect — no agent needed for a confirmed exposure"},
-    "js_secrets": {"agent": None, "skill": None, "note": "verify by hand (context for dummy/test keys) then report immediately if real — no agent needed"},
+    "js_secrets": {"agent": None, "skill": None, "note": "unverified only — check surrounding context for dummy/example/test keys before trusting it; see js_secrets_verified separately for confirmed-live hits"},
+    "js_secrets_verified": {"agent": None, "skill": "bugbounty-reports", "note": "CONFIRMED LIVE by trufflehog's own API call — no further verification needed, straight to reporting"},
     "takeover": {"agent": "subdomain-takeover", "skill": None, "note": "dedicated agent — deeper dangling-NS/MX/expired-domain analysis than nuclei's template-fingerprint-only check"},
     "cors": {"agent": "api-security", "skill": None, "note": "check for Access-Control-Allow-Credentials pairing"},
     "headers": {"agent": None, "skill": None, "note": "routine hardening — worth a clickjacking PoC only if a real state-changing action is reachable, see RECOMMENDATIONS"},
@@ -827,56 +819,108 @@ def extract_js_urls(all_urls: Path, triage_dir: Path) -> tuple[Path, int]:
     return out, len(lines)
 
 
-def js_secret_scan(js_urls: Path, triage_dir: Path, rate: int, headers: list[str] | None = None) -> tuple[Path, list]:
-    """Fetches every JS file via httpx's native -extract-regex and checks the
-    body against SECRET_PATTERNS. One httpx process, properly rate-limited —
-    no hand-rolled curl loop."""
+def trufflehog_secret_scan(js_urls: Path, triage_dir: Path, rate: int, headers: list[str] | None = None,
+                            verify: bool = True) -> tuple[Path, list]:
+    """Fetches every JS file's raw response (httpx -sr — request+response
+    headers included alongside the body; harmless noise for a secrets scan,
+    not worth reimplementing HTTP parsing to strip out) into a scratch
+    directory, then runs trufflehog's `filesystem` scan over it: ~800
+    maintained detectors instead of a hand-rolled pattern list, plus live
+    verification — an actual API call to the matched service (AWS, Slack,
+    Stripe, GitHub, ...) confirming whether the credential currently
+    authenticates, not just "shaped like one."
+
+    `filesystem` mode specifically, not `stdin` — verified live against the
+    installed binary that `stdin` mode's SourceMetadata comes back empty
+    (no filename), so a hit can't be mapped back to the URL it came from;
+    `filesystem` keeps that via SourceMetadata.Data.Filesystem.file, which
+    is matched against httpx's own `stored_response_path` field (also
+    verified live) to recover the original URL.
+
+    verify=False passes trufflehog --no-verification (Talon's
+    --no-secret-verify) — secrets are still detected, just not confirmed
+    live; the scratch directory is deleted either way once results are
+    captured, since the secret VALUES already live in js_secrets.jsonl and
+    there's no reason to keep potentially large raw JS dumps around."""
     jsonl_out = triage_dir / "js_secrets.jsonl"
     txt_out = triage_dir / "js_secrets.txt"
     urls_out = triage_dir / "js_secrets_urls.txt"
+    verified_out = triage_dir / "js_secrets_verified.txt"
+    bodies_dir = triage_dir / ".js_bodies"
+    fetch_raw = triage_dir / ".js_fetch.jsonl"
+    scan_raw = triage_dir / ".trufflehog_scan.jsonl"
+    shutil.rmtree(bodies_dir, ignore_errors=True)
+    bodies_dir.mkdir(parents=True)
 
-    cmd = [
+    fetch_cmd = [
         "httpx", "-duc", "-l", str(js_urls), "-silent", "-json",
-        "-timeout", "10", "-rate-limit", str(rate),
+        "-timeout", "10", "-rate-limit", str(rate), "-sr", "-srd", str(bodies_dir),
     ] + header_args(headers)
-    for _, pattern in SECRET_PATTERNS:
-        cmd += ["-er", pattern]
+    run_to_file(fetch_cmd, fetch_raw, "httpx:js-fetch", total=count_lines(js_urls))
 
-    progress = Progress("httpx:js-secrets")
-    result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    if result.returncode == 0:
-        progress.stop(f"{GREEN}[{ts()}] ✓{RESET} httpx:js-secrets complete")
-    else:
-        progress.stop(f"{YELLOW}[{ts()}] !{RESET} httpx:js-secrets exited {result.returncode}")
-    if result.returncode != 0 and not result.stdout:
-        warn(f"httpx JS secret scan exited {result.returncode} with no output")
+    file_to_url: dict[str, str] = {}
+    if fetch_raw.exists():
+        for line in fetch_raw.read_text(errors="ignore").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            stored = rec.get("stored_response_path")
+            if stored:
+                file_to_url[str(Path(stored).resolve())] = rec.get("url", "")
+        fetch_raw.unlink(missing_ok=True)
+
+    if not file_to_url:
+        shutil.rmtree(bodies_dir, ignore_errors=True)
+        for out in (jsonl_out, txt_out, urls_out, verified_out):
+            out.write_text("")
+        return txt_out, []
+
+    th_cmd = ["trufflehog", "filesystem", str(bodies_dir), "--json", "--no-update"]
+    if not verify:
+        th_cmd.append("--no-verification")
+    run_to_file(th_cmd, scan_raw, "trufflehog:scan")
 
     findings = []
     jsonl_lines = []
     txt_lines = []
+    verified_lines = []
     hit_urls = set()
 
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        extracts = rec.get("extracts") or {}
-        url = rec.get("url", "")
-        for pattern, matches in extracts.items():
-            name = SECRET_PATTERN_NAMES.get(pattern, pattern)
-            for match in matches:
-                findings.append({"url": url, "type": name, "match": match})
-                jsonl_lines.append(json.dumps({"url": url, "type": name, "match": match}))
-                txt_lines.append(f"{name}\t{url}\t{match}")
-                hit_urls.add(url)
+    if scan_raw.exists():
+        for line in scan_raw.read_text(errors="ignore").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "DetectorName" not in rec:
+                continue  # trufflehog's own status/log lines, not a finding
+            fs_path = (((rec.get("SourceMetadata") or {}).get("Data") or {}).get("Filesystem") or {}).get("file", "")
+            url = file_to_url.get(str(Path(fs_path).resolve()), fs_path) if fs_path else ""
+            verified = bool(rec.get("Verified"))
+            entry = {"url": url, "type": rec.get("DetectorName", "unknown"), "match": rec.get("Raw", ""), "verified": verified}
+            findings.append(entry)
+            jsonl_lines.append(json.dumps(entry))
+            txt_lines.append(f"{entry['type']}\t{'VERIFIED' if verified else 'unverified'}\t{url}\t{entry['match']}")
+            hit_urls.add(url)
+            if verified:
+                verified_lines.append(f"{entry['type']}\t{url}\t{entry['match']}")
+        scan_raw.unlink(missing_ok=True)
+
+    shutil.rmtree(bodies_dir, ignore_errors=True)
 
     jsonl_out.write_text("\n".join(jsonl_lines) + ("\n" if jsonl_lines else ""))
     txt_out.write_text("\n".join(txt_lines) + ("\n" if txt_lines else ""))
     urls_out.write_text("\n".join(sorted(hit_urls)) + ("\n" if hit_urls else ""))
+    verified_out.write_text("\n".join(sorted(verified_lines)) + ("\n" if verified_lines else ""))
+    if verified_lines:
+        warn(f"{len(verified_lines)} CONFIRMED LIVE credential(s) — see triage/js_secrets_verified.txt")
 
     return txt_out, findings
 
@@ -1765,15 +1809,17 @@ def write_recommendations_md(
         else:
             lines.append(f"| {label} | {n} |")
 
-    lines.append(f"\n## JS Secret Scan — {js_count} JS file(s) checked")
+    lines.append(f"\n## JS Secret Scan (trufflehog) — {js_count} JS file(s) checked")
     if secret_findings:
-        lines.append(f"\n{len(secret_findings)} potential secret(s) found — verify each by hand before trusting it.\n")
-        lines.append("| Type | URL | Match |")
-        lines.append("|---|---|---|")
-        for f in secret_findings:
-            lines.append(f"| {f['type']} | {f['url']} | `{f['match']}` |")
+        verified_n = sum(1 for f in secret_findings if f.get("verified"))
+        lines.append(f"\n{len(secret_findings)} secret(s) found — {verified_n} CONFIRMED LIVE, {len(secret_findings) - verified_n} unverified (detected but not confirmed; still check context before trusting).\n")
+        lines.append("| Status | Type | URL | Match |")
+        lines.append("|---|---|---|---|")
+        for f in sorted(secret_findings, key=lambda f: not f.get("verified")):
+            status = "**VERIFIED**" if f.get("verified") else "unverified"
+            lines.append(f"| {status} | {f['type']} | {f['url']} | `{f['match']}` |")
     elif js_count:
-        lines.append("\nNo known secret patterns matched.")
+        lines.append("\nNo secrets found.")
     else:
         lines.append("\nNo .js files found in this target's URL set.")
 
@@ -1806,7 +1852,8 @@ def write_recommendations_md(
         lines.append(f"\n### interestingEXT_dangerous ({dangerous_count} of {ext_live_count} live hits)")
         lines.append(RECOMMENDATIONS["interestingEXT_dangerous"].format(**terms))
     if secret_findings:
-        lines.append(f"\n### js_secrets ({len(secret_findings)} potential match{'es' if len(secret_findings) != 1 else ''})")
+        verified_n = sum(1 for f in secret_findings if f.get("verified"))
+        lines.append(f"\n### js_secrets ({len(secret_findings)} match{'es' if len(secret_findings) != 1 else ''}, {verified_n} confirmed live)")
         lines.append(RECOMMENDATIONS["js_secrets"].format(**terms))
     if takeover_findings:
         lines.append(f"\n### takeover ({len(takeover_findings)} candidate{'s' if len(takeover_findings) != 1 else ''})")
@@ -1881,7 +1928,10 @@ def build_next_steps(
     for cls in FUZZ_CLASSES + MANUAL_CLASSES:
         add(cls["slug"], gf_counts.get(cls["slug"], 0), f"triage/{cls['slug']}_candidates.txt")
     add("interestingEXT_dangerous", dangerous_count, "triage/interestingEXT_dangerous.txt")
-    add("js_secrets", len(secret_findings), "triage/js_secrets_urls.txt")
+    verified_secrets = [f for f in secret_findings if f.get("verified")]
+    unverified_secrets = [f for f in secret_findings if not f.get("verified")]
+    add("js_secrets", len(unverified_secrets), "triage/js_secrets.jsonl")
+    add("js_secrets_verified", len(verified_secrets), "triage/js_secrets_verified.txt")
     add("takeover", len(takeover_findings), "triage/takeover_urls.txt")
     add("cors", len(cors_findings), "triage/nuclei/nuclei_cors.jsonl")
     add("headers", len(headers_findings), "triage/nuclei/nuclei_headers.jsonl")
@@ -1993,13 +2043,13 @@ def write_json_summary(
     return out
 
 
-def discord_notify(target: str, url_count: int, secret_count: int, findings: list, manual_count: int):
+def discord_notify(target: str, url_count: int, secret_count: int, verified_secret_count: int, findings: list, manual_count: int):
     if shutil.which("notify") is None:
         warn("`notify` not found on PATH — skipping Discord summary")
         return
     sev = severity_breakdown(findings)
     sev_str = ", ".join(f"{v} {k}" for k, v in sev.items() if v) or "none"
-    secret_str = f", {secret_count} potential JS secret(s)" if secret_count else ""
+    secret_str = f", {secret_count} JS secret(s) ({verified_secret_count} CONFIRMED LIVE)" if secret_count else ""
     msg = (
         f"Talon triage done for {target} — {url_count} URLs triaged{secret_str}, "
         f"nuclei: {sev_str}, {manual_count} URLs queued for manual/proxy review."
@@ -2084,6 +2134,7 @@ def main():
     parser.add_argument("--proxy-timeout", type=int, default=10, help="Per-request curl --max-time for the proxy warm-up (default: 10)")
     parser.add_argument("--proxy-delay", type=float, default=None, help="Delay between proxy warm-up requests, seconds (default: derived from --rate, so the warm-up never exceeds the same requests/sec ceiling as everything else)")
     parser.add_argument("--no-js-scan", action="store_true", help="Skip fetching JS files and scanning them for hardcoded secrets")
+    parser.add_argument("--no-secret-verify", action="store_true", help="Skip trufflehog's live verification (real API calls confirming whether a found credential currently authenticates) — secrets are still detected, just not confirmed live. On by default because a confirmed-live credential is unambiguously worth knowing; opt out for a program that restricts using a found credential even to verify it, or to avoid the outbound third-party API calls entirely.")
     parser.add_argument("--no-host-scan", action="store_true", help="Skip the all-host severity:critical CVE/misconfig sweep (the slow one — ~1,870 templates x every alive host). CORS, takeover, and per-class fuzzing passes still run.")
     parser.add_argument("--max-candidates", type=int, default=None, help="Cap each fuzz class's deduped candidate list to this many (random sample) before nuclei scans it — bounds worst-case runtime against a URL-rich target instead of scanning every unique injection point found. Default: unlimited.")
     parser.add_argument("--no-waf-detect", action="store_true", help="Skip the wafw00f WAF/CDN detection pass (one representative host per apex domain, ~2 requests each — fast, but skippable if wafw00f isn't installed or you already know the WAF)")
@@ -2137,6 +2188,8 @@ def main():
         required_tools.append("curl")  # proxy_warmup() and check_wordpress_xmlrpc() both shell out to curl
     if not args.no_waf_detect:
         required_tools.append("wafw00f")
+    if not args.no_js_scan:
+        required_tools.append("trufflehog")
     if args.vhost_fuzz:
         required_tools.append("ffuf")
     if args.dir_brute:
@@ -2271,12 +2324,14 @@ def main():
         phase("JS SECRET SCAN")
         js_urls, js_count = extract_js_urls(all_urls, triage_dir)
         if js_count:
-            info(f"{js_count} JS file(s) found — checking for hardcoded secrets")
-            _, secret_findings = js_secret_scan(js_urls, triage_dir, args.rate, args.headers)
+            info(f"{js_count} JS file(s) found — checking for hardcoded secrets (trufflehog"
+                 + (", live verification" if not args.no_secret_verify else ", verification off") + ")")
+            _, secret_findings = trufflehog_secret_scan(js_urls, triage_dir, args.rate, args.headers, verify=not args.no_secret_verify)
             if secret_findings:
-                warn(f"{len(secret_findings)} potential secret(s) found in JS — see triage/js_secrets.txt")
+                verified_count = sum(1 for f in secret_findings if f.get("verified"))
+                warn(f"{len(secret_findings)} potential secret(s) found in JS ({verified_count} confirmed live) — see triage/js_secrets.txt")
             else:
-                success("No known secret patterns matched in JS files")
+                success("No secrets found in JS files")
         else:
             info("No .js files found in this target's URL set")
     else:
@@ -2393,7 +2448,7 @@ def main():
     )
 
     if args.discord:
-        discord_notify(target_label, url_count, len(secret_findings), findings, manual_count)
+        discord_notify(target_label, url_count, len(secret_findings), sum(1 for f in secret_findings if f.get("verified")), findings, manual_count)
 
     print()
     print(f"{DIM}{'─' * 60}{RESET}")
@@ -2420,7 +2475,9 @@ def main():
     if dirbrute_hits:
         print(f"  {DIM}{'DIR BRUTE HITS':<16}{RESET} {BOLD}{len(dirbrute_hits)}{RESET}")
     print(f"  {DIM}{'URLS TRIAGED':<16}{RESET} {BOLD}{url_count}{RESET}")
-    print(f"  {DIM}{'JS SECRETS':<16}{RESET} {BOLD}{len(secret_findings)}{RESET}")
+    verified_secret_count = sum(1 for f in secret_findings if f.get("verified"))
+    js_secrets_str = f"{len(secret_findings)}" + (f" ({verified_secret_count} CONFIRMED LIVE)" if verified_secret_count else "")
+    print(f"  {DIM}{'JS SECRETS':<16}{RESET} {BOLD}{js_secrets_str}{RESET}")
     print(f"  {DIM}{'NUCLEI FINDINGS':<16}{RESET} {BOLD}{len(findings)}{RESET}")
     if prev_state is not None:
         print(f"  {DIM}{'NEW SINCE LAST':<16}{RESET} {BOLD}{len(new_findings) + len(new_secrets) + len(new_dangerous) + len(new_manual)}{RESET}")

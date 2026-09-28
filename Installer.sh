@@ -17,15 +17,16 @@
 #     findomain                                       (recon)
 #     waymore, paramspider, wafw00f                   (recon/triage, via a venv)
 #     feroxbuster                                      (triage, --dir-brute)
-#     GF pattern definitions (~/.gf)                   (triage)
+#     trufflehog                                       (triage, JS secret scan + live verification)
+#     GF pattern definitions (~/.gf, + nosqli/proto-pollution written directly) (triage)
 #     nuclei-templates                                 (triage, pre-fetched)
 #     CMSeeK (~/Tools/CMSeeK)                           (triage, CMS fingerprint — optional, best-effort)
 #     SecLists (/usr/share/seclists)                    (triage, --vhost-fuzz/--dir-brute wordlists — optional, best-effort)
 #
-# wafw00f is a hard runtime dependency by default (talon.py only skips it
-# with --no-waf-detect) — everything else in this list is either opt-in
-# (ffuf/feroxbuster/SecLists) or degrades gracefully at runtime if missing
-# (CMSeeK).
+# wafw00f and trufflehog are hard runtime dependencies by default (talon.py
+# only skips them with --no-waf-detect / --no-js-scan respectively) —
+# everything else in this list is either opt-in (ffuf/feroxbuster/SecLists)
+# or degrades gracefully at runtime if missing (CMSeeK).
 #
 # Supported platforms:
 #   - Debian / Ubuntu / Kali / Mint
@@ -705,6 +706,82 @@ install_feroxbuster() {
 install_feroxbuster
 
 # ──────────────────────────────────────────────────────────────
+# TRUFFLEHOG
+# (secret verification for the JS secret-scan pass — required by default,
+# same as wafw00f, since talon.py only skips it with --no-js-scan)
+# ──────────────────────────────────────────────────────────────
+
+install_trufflehog() {
+    if bin_exists trufflehog; then
+        ok "trufflehog already installed — skipping."
+        return
+    fi
+
+    case "$PKG_MANAGER" in
+        brew)
+            info "Installing trufflehog with Homebrew..."
+            if brew install trufflehog >/dev/null 2>&1; then
+                ok "trufflehog installed."
+                return
+            fi
+            ;;
+    esac
+
+    # No apt/pacman/dnf package — trufflehog's own release assets embed the
+    # version in the filename (trufflehog_<version>_<os>_<arch>.tar.gz), so
+    # unlike findomain/feroxbuster's version-agnostic asset names, the
+    # current version has to be resolved first (same pattern install_go
+    # already uses against go.dev/VERSION).
+    local arch asset tmp_th url version tag
+    arch="$(uname -m)"
+
+    case "${OS}:${arch}" in
+        linux:x86_64 | linux:amd64)   asset_os="linux"; asset_arch="amd64"  ;;
+        linux:aarch64 | linux:arm64)  asset_os="linux"; asset_arch="arm64"  ;;
+        macos:x86_64 | macos:amd64)   asset_os="darwin"; asset_arch="amd64" ;;
+        macos:arm64 | macos:aarch64)  asset_os="darwin"; asset_arch="arm64" ;;
+        *)
+            warn "No known prebuilt trufflehog binary for ${OS}/${arch}."
+            warn "JS secret scanning will be unavailable until it's installed manually: https://github.com/trufflesecurity/trufflehog"
+            return
+            ;;
+    esac
+
+    info "Resolving latest trufflehog release..."
+    tag="$(curl -fsSL https://api.github.com/repos/trufflesecurity/trufflehog/releases/latest | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/')"
+
+    if [[ -z "$tag" ]]; then
+        warn "Could not resolve the latest trufflehog version (GitHub API rate limit or network issue)."
+        warn "JS secret scanning will be unavailable until it's installed manually: https://github.com/trufflesecurity/trufflehog"
+        return
+    fi
+
+    asset="trufflehog_${tag}_${asset_os}_${asset_arch}.tar.gz"
+    url="https://github.com/trufflesecurity/trufflehog/releases/latest/download/${asset}"
+    tmp_th="$(mktemp -d)"
+
+    info "Downloading trufflehog ${tag}..."
+
+    if curl -fsSL "$url" -o "$tmp_th/trufflehog.tar.gz"; then
+        if tar -xzf "$tmp_th/trufflehog.tar.gz" -C "$tmp_th" trufflehog 2>/dev/null; then
+            chmod +x "$tmp_th/trufflehog"
+            $SUDO install -m 0755 "$tmp_th/trufflehog" /usr/local/bin/trufflehog
+            ok "trufflehog installed to /usr/local/bin/trufflehog."
+        else
+            warn "trufflehog archive did not extract as expected."
+            warn "JS secret scanning will be unavailable until it's installed manually."
+        fi
+    else
+        warn "Could not download trufflehog (a release tagged moments ago can take ~15min for CI to attach binaries — try again shortly, or install manually)."
+        warn "JS secret scanning will be unavailable until it's installed manually: https://github.com/trufflesecurity/trufflehog"
+    fi
+
+    rm -rf "$tmp_th"
+}
+
+install_trufflehog
+
+# ──────────────────────────────────────────────────────────────
 # PYTHON ENVIRONMENT
 # (dedicated venv — no --break-system-packages needed)
 # ──────────────────────────────────────────────────────────────
@@ -956,7 +1033,7 @@ TOOLS=(
     curl jq go python3
     subfinder httpx dnsx naabu katana
     assetfinder anew subfaster findomain
-    waymore paramspider wafw00f
+    waymore paramspider wafw00f trufflehog
     gf nuclei notify ffuf feroxbuster
     talon
 )
