@@ -401,7 +401,12 @@ install_go_from_official() {
 
     info "Fetching current Go release from go.dev..."
 
-    go_tag="$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -n1)"
+    # `|| true` is load-bearing under this script's `set -euo pipefail`: a
+    # failed curl here would otherwise abort the script immediately, before
+    # the helpful fail()+exit below ever runs — the user would just see a
+    # bare, unexplained stop instead of "Could not determine the latest Go
+    # release, install manually."
+    go_tag="$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -n1)" || true
 
     if [[ -z "$go_tag" ]]; then
         fail "Could not determine the latest Go release."
@@ -429,12 +434,18 @@ install_go() {
     local current_version=""
 
     if command -v go >/dev/null 2>&1; then
+        # `|| true` is load-bearing under this script's `set -euo pipefail`:
+        # grep -oE returns non-zero when go version's output doesn't match
+        # the expected pattern (unexpected format, patched/beta go build),
+        # which under pipefail would otherwise abort the whole installer
+        # here instead of falling through to the "install/upgrade Go"
+        # logic this block exists to reach.
         current_version="$(
             go version |
             grep -oE 'go[0-9]+\.[0-9]+(\.[0-9]+)?' |
             sed 's/^go//' |
             head -n1
-        )"
+        )" || true
 
         if [[ -n "$current_version" ]] && go_version_ok "$current_version"; then
             ok "Go ${current_version} already installed."
@@ -458,12 +469,18 @@ install_go() {
     hash -r 2>/dev/null || true
 
     if command -v go >/dev/null 2>&1; then
+        # `|| true` is load-bearing under this script's `set -euo pipefail`:
+        # grep -oE returns non-zero when go version's output doesn't match
+        # the expected pattern (unexpected format, patched/beta go build),
+        # which under pipefail would otherwise abort the whole installer
+        # here instead of falling through to the "install/upgrade Go"
+        # logic this block exists to reach.
         current_version="$(
             go version |
             grep -oE 'go[0-9]+\.[0-9]+(\.[0-9]+)?' |
             sed 's/^go//' |
             head -n1
-        )"
+        )" || true
 
         if [[ -n "$current_version" ]] && go_version_ok "$current_version"; then
             ok "Go ${current_version} installed."
@@ -732,7 +749,7 @@ install_trufflehog() {
     # unlike findomain/feroxbuster's version-agnostic asset names, the
     # current version has to be resolved first (same pattern install_go
     # already uses against go.dev/VERSION).
-    local arch asset tmp_th url version tag
+    local arch asset asset_os asset_arch tmp_th url tag
     arch="$(uname -m)"
 
     case "${OS}:${arch}" in
@@ -748,7 +765,12 @@ install_trufflehog() {
     esac
 
     info "Resolving latest trufflehog release..."
-    tag="$(curl -fsSL https://api.github.com/repos/trufflesecurity/trufflehog/releases/latest | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/')"
+    # `|| true` is load-bearing under this script's `set -euo pipefail`: a
+    # failed curl (network issue, GitHub rate limit) would otherwise abort
+    # the ENTIRE installer at this line instead of hitting the graceful
+    # fallback below — confirmed by testing the exact construct without
+    # `|| true` and watching it kill the whole script on a failed curl.
+    tag="$(curl -fsSL https://api.github.com/repos/trufflesecurity/trufflehog/releases/latest 2>/dev/null | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/')" || true
 
     if [[ -z "$tag" ]]; then
         warn "Could not resolve the latest trufflehog version (GitHub API rate limit or network issue)."
