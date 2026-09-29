@@ -927,6 +927,24 @@ def trufflehog_secret_scan(js_urls: Path, triage_dir: Path, rate: int, headers: 
 
 NUCLEI_STATS_FLAGS = ["-stats", "-stats-json", "-stats-interval", "2"]
 
+# nuclei's own -max-host-error defaults to 30 — the "give up on a
+# consistently-erroring host" safety net. That default is fine for a pass
+# with hundreds/thousands of templates (nuclei_host_scan, the takeover
+# pass's 73 templates, the naabu network-confirm pass's ~286) — a bad host
+# accumulates 30 errors fast there and gets skipped. It's structurally
+# USELESS for a small dedicated pass: cors (5 templates), headers (1),
+# hardening (5), graphql (10), smuggling (2), cookies (3) can never
+# generate 30 errors against a single host within one pass, so a host
+# that accepts the TCP/TLS handshake and then never responds — confirmed
+# live against a real target: nuclei sat on 7 idle, zero-byte connections
+# to two hosts for 8.7 hours on the graphql pass, `-timeout 10`'s default
+# apparently not firing for whatever this specific stall shape was —
+# stalls the ENTIRE pass with no way to route around it. Lower threshold
+# here means nuclei abandons a bad host after 3 failed requests instead
+# of hoping a per-request timeout that may not be firing eventually saves
+# it.
+NUCLEI_SMALL_PASS_FLAGS = ["-max-host-error", "3"]
+
 
 def nuclei_host_scan(alive: Path, nuclei_dir: Path, rate: int, headers: list[str] | None = None) -> Path | None:
     """severity:critical, not medium,high,critical — measured directly:
@@ -961,7 +979,7 @@ def nuclei_cors_scan(alive: Path, nuclei_dir: Path, rate: int, headers: list[str
     cmd = [
         "nuclei", "-silent", "-l", str(alive), "-tags", "cors",
         "-etags", "dos", "-rate-limit", str(rate), "-jsonl", "-o", str(out),
-    ] + header_args(headers) + NUCLEI_STATS_FLAGS
+    ] + NUCLEI_SMALL_PASS_FLAGS + header_args(headers) + NUCLEI_STATS_FLAGS
     returncode = run_nuclei_with_progress(cmd, "nuclei:cors")
     if returncode != 0:
         warn(f"nuclei CORS pass exited {returncode}")
@@ -995,7 +1013,7 @@ def nuclei_headers_scan(alive: Path, nuclei_dir: Path, rate: int, headers: list[
         "nuclei", "-silent", "-l", str(alive),
         "-t", "http/misconfiguration/http-missing-security-headers.yaml",
         "-etags", "dos", "-rate-limit", str(rate), "-jsonl", "-o", str(out),
-    ] + header_args(headers) + NUCLEI_STATS_FLAGS
+    ] + NUCLEI_SMALL_PASS_FLAGS + header_args(headers) + NUCLEI_STATS_FLAGS
     returncode = run_nuclei_with_progress(cmd, "nuclei:headers")
     if returncode != 0:
         warn(f"nuclei security-headers pass exited {returncode}")
@@ -1021,7 +1039,7 @@ def nuclei_hardening_scan(alive: Path, nuclei_dir: Path, rate: int, headers: lis
         "nuclei", "-silent", "-l", str(alive), "-tags", HARDENING_TAGS,
         "-t", GENERIC_FUZZ_TEMPLATES,
         "-etags", "dos", "-rate-limit", str(rate), "-jsonl", "-o", str(out),
-    ] + header_args(headers) + NUCLEI_STATS_FLAGS
+    ] + NUCLEI_SMALL_PASS_FLAGS + header_args(headers) + NUCLEI_STATS_FLAGS
     returncode = run_nuclei_with_progress(cmd, "nuclei:hardening")
     if returncode != 0:
         warn(f"nuclei hardening pass exited {returncode}")
@@ -1042,7 +1060,7 @@ def nuclei_graphql_scan(alive: Path, nuclei_dir: Path, rate: int, headers: list[
         "nuclei", "-silent", "-l", str(alive), "-tags", "graphql",
         "-t", GRAPHQL_TEMPLATES,
         "-etags", "dos", "-rate-limit", str(rate), "-jsonl", "-o", str(out),
-    ] + header_args(headers) + NUCLEI_STATS_FLAGS
+    ] + NUCLEI_SMALL_PASS_FLAGS + header_args(headers) + NUCLEI_STATS_FLAGS
     returncode = run_nuclei_with_progress(cmd, "nuclei:graphql")
     if returncode != 0:
         warn(f"nuclei GraphQL pass exited {returncode}")
@@ -1062,7 +1080,7 @@ def nuclei_smuggling_scan(alive: Path, nuclei_dir: Path, rate: int, headers: lis
         "nuclei", "-silent", "-l", str(alive), "-tags", "smuggling",
         "-t", SMUGGLING_TEMPLATES,
         "-etags", "dos", "-rate-limit", str(rate), "-jsonl", "-o", str(out),
-    ] + header_args(headers) + NUCLEI_STATS_FLAGS
+    ] + NUCLEI_SMALL_PASS_FLAGS + header_args(headers) + NUCLEI_STATS_FLAGS
     returncode = run_nuclei_with_progress(cmd, "nuclei:smuggling")
     if returncode != 0:
         warn(f"nuclei smuggling pass exited {returncode}")
@@ -1094,7 +1112,7 @@ def nuclei_cookie_scan(alive: Path, nuclei_dir: Path, rate: int, headers: list[s
     cmd = [
         "nuclei", "-silent", "-l", str(alive), "-t", COOKIE_TEMPLATES,
         "-etags", "dos", "-rate-limit", str(rate), "-jsonl", "-o", str(out),
-    ] + header_args(headers) + NUCLEI_STATS_FLAGS
+    ] + NUCLEI_SMALL_PASS_FLAGS + header_args(headers) + NUCLEI_STATS_FLAGS
     returncode = run_nuclei_with_progress(cmd, "nuclei:cookies")
     if returncode != 0:
         warn(f"nuclei cookie-security pass exited {returncode}")
