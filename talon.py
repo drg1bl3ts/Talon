@@ -121,6 +121,26 @@ MANUAL_CLASSES = [
     {"slug": "proto_pollution", "pattern": "proto-pollution"},
 ]
 
+# Fixed nuclei misconfiguration/host-level checks — not GF-pattern-driven
+# fuzzing against crawled candidate URLs like FUZZ_CLASSES, so they don't
+# fit nuclei_class_scans()'s per-class loop (each one is its own standalone
+# scan function: nuclei_cors_scan, nuclei_headers_scan, nuclei_hardening_scan,
+# nuclei_graphql_scan, nuclei_smuggling_scan, nuclei_cookie_scan,
+# nuclei_takeover_scan — see those definitions below). Listed here only so
+# the vulnerability-class filter can gate them the same way it gates
+# --xss/--sqli/etc: with no filter flag set, every one of these still runs
+# by default (unchanged); set any filter flag (from here or FUZZ/MANUAL_CLASSES)
+# and only the ones explicitly named run.
+HOSTLEVEL_CLASSES = [
+    {"slug": "cors", "desc": "CORS misconfiguration"},
+    {"slug": "headers", "desc": "missing/weak security headers"},
+    {"slug": "hardening", "desc": "XXE/CRLF/cache-poisoning/Host-header-injection checks"},
+    {"slug": "graphql", "desc": "GraphQL detection + misconfiguration"},
+    {"slug": "smuggling", "desc": "HTTP request smuggling"},
+    {"slug": "cookies", "desc": "session-cookie hardening (SameSite/HttpOnly/Secure)"},
+    {"slug": "takeover", "desc": "subdomain/dangling-CNAME takeover"},
+]
+
 # The exposure *is* the file existing — checked with httpx, not nuclei.
 EXT_CLASS = {"slug": "interestingEXT", "pattern": "interestingEXT"}
 
@@ -2092,15 +2112,15 @@ def determine_target_and_label(target: str | None, list_file: str | None) -> tup
     """Returns (outdir_target, display_label), used by resolve_outdir() as
     the results/<outdir_target> name when --indir/$OUTDIR aren't set.
 
-    For -t, outdir_target is just the target domain. For -l, it's the list
-    file's containing directory name rather than the first alphabetical
-    domain in it — --list workflows are typically one directory per
-    engagement (e.g. ~/work/coupang/domains.txt), and that folder name
-    reads far better as the results dir than an arbitrary domain would.
-    Falls back to the first domain if the list file has no meaningful
-    parent (e.g. it's at filesystem root)."""
+    For -t, outdir_target is just the target domain (if -t was a full URL,
+    its hostname). For -l, it's the list file's containing directory name
+    rather than the first alphabetical domain in it — --list workflows are
+    typically one directory per engagement (e.g. ~/work/coupang/domains.txt),
+    and that folder name reads far better as the results dir than an
+    arbitrary domain would. Falls back to the first domain if the list file
+    has no meaningful parent (e.g. it's at filesystem root)."""
     try:
-        targets, label = recon.load_targets(target, list_file)
+        targets, label, _ = recon.load_targets(target, list_file)
     except ValueError as e:
         die(str(e))
     if list_file:
@@ -2117,6 +2137,7 @@ def main():
         epilog=(
             "Examples:\n"
             "  talon.py -t example.com\n"
+            "  talon.py -t https://www.example.com   # single host only, no subdomain discovery\n"
             "  talon.py -l domains.txt\n"
             "  talon.py -t example.com --skip-recon\n"
             "  talon.py -t example.com --scope-file scope.txt\n"
@@ -2128,7 +2149,7 @@ def main():
         ),
     )
     target_group = parser.add_mutually_exclusive_group(required=True)
-    target_group.add_argument("-t", "--target", default=None, help="Single target domain")
+    target_group.add_argument("-t", "--target", default=None, help="Single target domain (e.g. example.com — runs the full subfinder-and-friends subdomain sweep), or a single full URL (e.g. https://www.example.com — skips subdomain discovery entirely and narrows scope to that exact host, no subdomains)")
     target_group.add_argument("-l", "--list", dest="list_file", default=None, help="File with one domain per line (multi-target), or a HackerOne scope CSV export (detected by .csv extension)")
     parser.add_argument("--skip-recon", action="store_true", help="Skip Talon's own recon pipeline; use an existing results dir")
     parser.add_argument("--indir", default=None, help="Custom output dir (default: results/<target> or $OUTDIR)")
@@ -2163,14 +2184,20 @@ def main():
 
     vuln_group = parser.add_argument_group(
         "vulnerability-class filter",
-        "Opt-in: with none of these set, every class below is triaged (today's default behavior). "
-        "Set one or more to restrict gf triage + nuclei fuzzing + the manual queue to just those classes — "
-        "e.g. --ssrf --lfi triages only SSRF and LFI candidates. Recon itself always runs in full; "
-        "this only narrows what triage does with its output.",
+        "Opt-in: with none of these set, every class below is triaged (today's default behavior), "
+        "including the fixed nuclei misconfiguration checks (cors/headers/hardening/graphql/smuggling/"
+        "cookies/takeover), which otherwise always run regardless of the GF-pattern classes selected. "
+        "Set one or more to restrict gf triage + nuclei fuzzing + the manual queue + those fixed checks "
+        "to just the named classes — e.g. --xss triages ONLY XSS candidates and skips cors/headers/"
+        "hardening/graphql/smuggling/cookies/takeover too; --ssrf --lfi triages only SSRF and LFI "
+        "candidates. Recon itself always runs in full; this only narrows what triage does with its output.",
     )
     for cls in FUZZ_CLASSES + MANUAL_CLASSES:
         flag = "--" + cls["slug"].replace("_", "-")
         vuln_group.add_argument(flag, action="store_true", dest=f"vuln_{cls['slug']}", help=f"Restrict triage to (at least) {cls['slug']} candidates")
+    for cls in HOSTLEVEL_CLASSES:
+        flag = "--" + cls["slug"].replace("_", "-")
+        vuln_group.add_argument(flag, action="store_true", dest=f"vuln_{cls['slug']}", help=f"Restrict triage to (at least) {cls['desc']} (otherwise runs unconditionally, like today)")
 
     parser.add_argument("--discord", action="store_true", help="Send a clean summary to Discord via `notify` when done")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
@@ -2188,15 +2215,18 @@ def main():
     # terminology for its "how to follow up" guidance.
     terms = PROXY_TOOLS[args.proxy] if args.proxy else PROXY_TOOLS["caido"]
 
-    selected_slugs = [cls["slug"] for cls in FUZZ_CLASSES + MANUAL_CLASSES if getattr(args, f"vuln_{cls['slug']}")]
+    ALL_FILTERABLE_CLASSES = FUZZ_CLASSES + MANUAL_CLASSES + HOSTLEVEL_CLASSES
+    selected_slugs = [cls["slug"] for cls in ALL_FILTERABLE_CLASSES if getattr(args, f"vuln_{cls['slug']}")]
     if selected_slugs:
         active_fuzz_classes = [c for c in FUZZ_CLASSES if c["slug"] in selected_slugs]
         active_manual_classes = [c for c in MANUAL_CLASSES if c["slug"] in selected_slugs]
-        skipped_classes = [c["slug"] for c in FUZZ_CLASSES + MANUAL_CLASSES if c["slug"] not in selected_slugs]
+        active_hostlevel_slugs = [c["slug"] for c in HOSTLEVEL_CLASSES if c["slug"] in selected_slugs]
+        skipped_classes = [c["slug"] for c in ALL_FILTERABLE_CLASSES if c["slug"] not in selected_slugs]
         info(f"vulnerability-class filter active — triaging only: {', '.join(selected_slugs)}")
     else:
         active_fuzz_classes = FUZZ_CLASSES
         active_manual_classes = MANUAL_CLASSES
+        active_hostlevel_slugs = [c["slug"] for c in HOSTLEVEL_CLASSES]
         skipped_classes = []
 
     outdir_target, target_label = determine_target_and_label(args.target, args.list_file)
@@ -2229,13 +2259,23 @@ def main():
     triage_dir.mkdir(parents=True, exist_ok=True)
     nuclei_dir.mkdir(parents=True, exist_ok=True)
 
+    single_url_target = bool(args.target and "://" in args.target)
+
     scope_domains = None
     alive_path = outdir / "recon" / "fresh_alive_domains"
     if args.scope_file:
         phase("SCOPE FILTER")
         scope_domains = load_scope(Path(args.scope_file))
         success(f"{len(scope_domains)} in-scope domain(s) loaded from {args.scope_file}")
+        if single_url_target:
+            warn(f"-t was a full URL ({outdir_target} only) but --scope-file was also passed — "
+                 f"--scope-file wins; drop it if you want the URL's implicit exact-host scope instead")
+    elif single_url_target:
+        phase("SCOPE FILTER")
+        scope_domains = [(outdir_target, False)]  # wildcard=False: this exact host only, no subdomains
+        success(f"-t was a full URL — scope narrowed to {outdir_target} only (subdomains excluded)")
 
+    if scope_domains:
         alive_path, kept, dropped = filter_by_scope(
             outdir / "recon" / "fresh_alive_domains", triage_dir / "fresh_alive_domains.inscope", scope_domains
         )
@@ -2355,23 +2395,34 @@ def main():
     else:
         info("--no-js-scan set — skipping JS secret scan")
 
+    def hostlevel_scan(slug: str, fn, desc: str) -> Path | None:
+        """Gates one of the fixed misconfiguration scans (cors/headers/
+        hardening/graphql/smuggling/cookies/takeover) behind the
+        vulnerability-class filter — runs unconditionally (today's
+        default) unless a filter flag is set and this slug isn't one of
+        the ones named."""
+        if slug not in active_hostlevel_slugs:
+            info(f"vulnerability-class filter active — skipping {desc} (pass --{slug.replace('_', '-')} to include it)")
+            return None
+        return fn(alive_path, nuclei_dir, args.rate, args.headers)
+
     phase("VULNERABILITY DISCOVERY — nuclei")
     if args.no_host_scan:
         info("--no-host-scan set — skipping the all-host CVE/misconfig sweep")
         host_out = None
     else:
         host_out = nuclei_host_scan(alive_path, nuclei_dir, args.rate, args.headers)
-    cors_out = nuclei_cors_scan(alive_path, nuclei_dir, args.rate, args.headers)
+    cors_out = hostlevel_scan("cors", nuclei_cors_scan, "CORS misconfiguration")
     cors_findings = parse_nuclei_jsonl([cors_out] if cors_out else [])
-    headers_out = nuclei_headers_scan(alive_path, nuclei_dir, args.rate, args.headers)
+    headers_out = hostlevel_scan("headers", nuclei_headers_scan, "missing/weak security headers")
     headers_findings = parse_nuclei_jsonl([headers_out] if headers_out else [])
-    hardening_out = nuclei_hardening_scan(alive_path, nuclei_dir, args.rate, args.headers)
+    hardening_out = hostlevel_scan("hardening", nuclei_hardening_scan, "XXE/CRLF/cache-poisoning/Host-header-injection checks")
     hardening_findings = parse_nuclei_jsonl([hardening_out] if hardening_out else [])
-    graphql_out = nuclei_graphql_scan(alive_path, nuclei_dir, args.rate, args.headers)
+    graphql_out = hostlevel_scan("graphql", nuclei_graphql_scan, "GraphQL detection + misconfiguration")
     graphql_findings = parse_nuclei_jsonl([graphql_out] if graphql_out else [])
-    smuggling_out = nuclei_smuggling_scan(alive_path, nuclei_dir, args.rate, args.headers)
+    smuggling_out = hostlevel_scan("smuggling", nuclei_smuggling_scan, "HTTP request smuggling")
     smuggling_findings = parse_nuclei_jsonl([smuggling_out] if smuggling_out else [])
-    cookie_out = nuclei_cookie_scan(alive_path, nuclei_dir, args.rate, args.headers)
+    cookie_out = hostlevel_scan("cookies", nuclei_cookie_scan, "session-cookie hardening (SameSite/HttpOnly/Secure)")
     cookie_findings = parse_nuclei_jsonl([cookie_out] if cookie_out else [])
     class_outs = nuclei_class_scans(triage_dir, nuclei_dir, args.rate, active_fuzz_classes, args.headers, args.max_candidates)
     all_paths = ([host_out] if host_out else []) + [p for _, p in class_outs]
@@ -2382,7 +2433,7 @@ def main():
     success(f"nuclei complete — {len(findings)} finding(s)")
 
     phase("SUBDOMAIN TAKEOVER CHECK")
-    takeover_out = nuclei_takeover_scan(alive_path, nuclei_dir, args.rate, args.headers)
+    takeover_out = hostlevel_scan("takeover", nuclei_takeover_scan, "subdomain/dangling-CNAME takeover")
     takeover_findings = parse_nuclei_jsonl([takeover_out] if takeover_out else [])
     if takeover_findings:
         warn(f"{len(takeover_findings)} possible takeover(s) — verify manually before claiming, see triage/nuclei/nuclei_takeover.jsonl")

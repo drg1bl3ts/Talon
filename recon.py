@@ -69,21 +69,40 @@ def is_valid_domain(d: str) -> bool:
     return bool(_DOMAIN_RE.match(d))
 
 
-def load_targets(target: str | None, list_file: str | None) -> tuple[list[str], str]:
-    """Handles -t/-l target selection: a single validated domain, or a
-    deduped, validated set of domains from a file — one-per-line, or a raw
-    HackerOne scope CSV export (detected by .csv extension, parsed the same
-    way --scope-file parses one). Returns (targets, label)."""
+def load_targets(target: str | None, list_file: str | None) -> tuple[list[str], str, bool]:
+    """Handles -t/-l target selection: a single validated domain, a single
+    full URL, or a deduped, validated set of domains from a file —
+    one-per-line, or a raw HackerOne scope CSV export (detected by .csv
+    extension, parsed the same way --scope-file parses one).
+
+    A URL target (anything containing "://", e.g. -t
+    https://www.example.com) is narrower than a bare domain on purpose:
+    only its hostname is used as the single recon target, and the bool
+    returned as the third element (single_host_only) tells run_full_recon()
+    to skip subdomain discovery entirely and tells talon.py's scope filter
+    to accept that exact host only — no subdomains. A bare domain keeps the
+    existing behavior (full subfinder-and-friends subdomain sweep).
+
+    Returns (targets, label, single_host_only)."""
     if target and list_file:
         raise ValueError("Use either target or list_file, not both.")
     if not target and not list_file:
         raise ValueError("A target is required.")
 
     if target:
-        target = target.strip().lower()
+        target = target.strip()
+        if "://" in target:
+            parsed = urlparse(target)
+            hostname = (parsed.hostname or "").lower()
+            if not hostname or not is_valid_domain(hostname):
+                raise ValueError(f"Invalid target URL: {target}")
+            if parsed.path not in ("", "/") or parsed.query:
+                warn(f"Target URL's path/query is ignored — scope narrowed to host {hostname} only")
+            return [hostname], target, True
+        target = target.lower()
         if not is_valid_domain(target):
             raise ValueError(f"Invalid target: {target}")
-        return [target], target
+        return [target], target, False
 
     path = Path(list_file)
     if not path.is_file():
@@ -118,7 +137,7 @@ def load_targets(target: str | None, list_file: str | None) -> tuple[list[str], 
         warn(f"{skipped} invalid/non-domain entr{'y' if skipped == 1 else 'ies'} skipped from {list_file}")
 
     targets = sorted(targets)
-    return targets, f"{len(targets)} domains ({list_file})"
+    return targets, f"{len(targets)} domains ({list_file})", False
 
 
 def in_scope(host: str, targets: list[str]) -> bool:
@@ -493,7 +512,7 @@ def run_full_recon(target: str | None, list_file: str | None, outdir: Path,
     passes."""
     which_or_die(RECON_TOOLS)
 
-    targets, label = load_targets(target, list_file)
+    targets, label, single_host_only = load_targets(target, list_file)
 
     outdir.mkdir(parents=True, exist_ok=True)
     outdir = outdir.resolve()
@@ -507,7 +526,12 @@ def run_full_recon(target: str | None, list_file: str | None, outdir: Path,
         targets_file = tmpdir / "targets.txt"
         targets_file.write_text("\n".join(targets) + "\n")
 
-        subs_path = discover_subdomains(targets, targets_file, outdir)
+        if single_host_only:
+            info(f"URL target — skipping subdomain discovery, scope narrowed to {targets[0]} only")
+            subs_path = outdir / "recon" / "subs.txt"
+            subs_path.write_text(targets[0] + "\n")
+        else:
+            subs_path = discover_subdomains(targets, targets_file, outdir)
         alive_path = alive_check(subs_path, outdir, headers, rate)
         resolved_path = dns_enumeration(alive_path, outdir)
         port_discovery(resolved_path, outdir, rate)
