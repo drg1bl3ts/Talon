@@ -557,6 +557,10 @@ go_install "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest" "nuclei"
 go_install "github.com/projectdiscovery/notify/cmd/notify@latest"    "notify"
 go_install "github.com/ffuf/ffuf/v2@latest"                          "ffuf"
 
+# Opt-in: --github-recon (secrets_hunt_git + cicd_scan)
+go_install "github.com/zricethezav/gitleaks/v8@latest"                                  "gitleaks"
+go_install "github.com/sisaku-security/sisakulint/cmd/sisakulint@latest"                "sisakulint"
+
 ok "Go-based tools processed."
 
 hash -r 2>/dev/null || true
@@ -723,6 +727,31 @@ install_feroxbuster() {
 install_feroxbuster
 
 # ──────────────────────────────────────────────────────────────
+# X8
+# (opt-in: --param-fuzz hidden-parameter discovery, alongside arjun)
+# ──────────────────────────────────────────────────────────────
+
+install_x8() {
+    if bin_exists x8; then
+        ok "x8 already installed — skipping."
+        return
+    fi
+    if ! command -v cargo >/dev/null 2>&1; then
+        warn "cargo not found — --param-fuzz's x8 half will be unavailable."
+        warn "Install Rust (https://rustup.rs) then: cargo install x8"
+        return
+    fi
+    info "Installing x8 via cargo (this can take a few minutes)..."
+    if cargo install x8 --root "$(dirname "$LOCAL_BIN")" >/dev/null 2>&1; then
+        ok "x8 installed."
+    else
+        warn "cargo install x8 failed. --param-fuzz's x8 half will be unavailable until installed manually."
+    fi
+}
+
+install_x8
+
+# ──────────────────────────────────────────────────────────────
 # TRUFFLEHOG
 # (secret verification for the JS secret-scan pass — required by default,
 # same as wafw00f, since talon.py only skips it with --no-js-scan)
@@ -804,6 +833,86 @@ install_trufflehog() {
 install_trufflehog
 
 # ──────────────────────────────────────────────────────────────
+# DALFOX
+# (opt-in: --xss-confirm. v3 is a complete rewrite in Rust — the old v2
+# Go line, installable via `go install .../dalfox/v2@latest`, is now a
+# security-backports-only branch. Confirmed directly this session: a v2
+# `go install` succeeds and produces a working binary with a DIFFERENT,
+# older CLI shape, so a naive go-tools-style install silently gets you
+# the wrong version. Release assets embed the version like trufflehog's.)
+# ──────────────────────────────────────────────────────────────
+
+install_dalfox() {
+    if bin_exists dalfox; then
+        ok "dalfox already installed — skipping."
+        return
+    fi
+
+    case "$PKG_MANAGER" in
+        brew)
+            info "Installing dalfox with Homebrew..."
+            if brew install dalfox >/dev/null 2>&1; then
+                ok "dalfox installed."
+                return
+            fi
+            ;;
+    esac
+
+    local arch asset_arch asset_os asset tmp_dx url tag
+    arch="$(uname -m)"
+
+    case "${OS}:${arch}" in
+        linux:x86_64 | linux:amd64)   asset_os="linux"; asset_arch="x86_64"  ;;
+        linux:aarch64 | linux:arm64)  asset_os="linux"; asset_arch="aarch64" ;;
+        macos:x86_64 | macos:amd64)   asset_os="macos"; asset_arch="x86_64"  ;;
+        macos:arm64 | macos:aarch64)  asset_os="macos"; asset_arch="aarch64" ;;
+        *)
+            warn "No known prebuilt dalfox binary for ${OS}/${arch}."
+            warn "--xss-confirm will be unavailable until it's installed manually: https://github.com/hahwul/dalfox"
+            return
+            ;;
+    esac
+
+    info "Resolving latest dalfox release..."
+    tag="$(curl -fsSL https://api.github.com/repos/hahwul/dalfox/releases/latest 2>/dev/null | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/')" || true
+
+    if [[ -z "$tag" ]]; then
+        warn "Could not resolve the latest dalfox version (GitHub API rate limit or network issue)."
+        warn "--xss-confirm will be unavailable until it's installed manually: https://github.com/hahwul/dalfox"
+        return
+    fi
+
+    asset="dalfox-v${tag}-${asset_os}-${asset_arch}.tar.gz"
+    url="https://github.com/hahwul/dalfox/releases/download/v${tag}/${asset}"
+    tmp_dx="$(mktemp -d)"
+
+    info "Downloading dalfox v${tag}..."
+
+    if curl -fsSL "$url" -o "$tmp_dx/dalfox.tar.gz"; then
+        if tar -xzf "$tmp_dx/dalfox.tar.gz" -C "$tmp_dx"; then
+            local binary
+            binary="$(find "$tmp_dx" -type f -name 'dalfox' -print -quit)"
+            if [[ -n "$binary" ]]; then
+                chmod +x "$binary"
+                $SUDO install -m 0755 "$binary" /usr/local/bin/dalfox
+                ok "dalfox installed to /usr/local/bin/dalfox."
+            else
+                warn "dalfox archive did not contain the expected binary."
+                warn "--xss-confirm will be unavailable until installed manually."
+            fi
+        else
+            warn "Could not extract dalfox archive. --xss-confirm will be unavailable until installed manually."
+        fi
+    else
+        warn "Could not download dalfox. --xss-confirm will be unavailable until installed manually: https://github.com/hahwul/dalfox"
+    fi
+
+    rm -rf "$tmp_dx"
+}
+
+install_dalfox
+
+# ──────────────────────────────────────────────────────────────
 # PYTHON ENVIRONMENT
 # (dedicated venv — no --break-system-packages needed)
 # ──────────────────────────────────────────────────────────────
@@ -840,6 +949,14 @@ install_python_tools() {
         # it) — unlike waymore/paramspider this one isn't optional.
         info "Installing wafw00f..."
         "$PYTHON_VENV/bin/python" -m pip install --upgrade wafw00f >/dev/null
+    fi
+
+    if [[ -x "${PYTHON_VENV}/bin/arjun" ]] || command -v arjun >/dev/null 2>&1; then
+        ok "arjun already installed — skipping."
+    else
+        # Opt-in: --param-fuzz (paired with x8, installed separately via cargo)
+        info "Installing arjun..."
+        "$PYTHON_VENV/bin/python" -m pip install --upgrade arjun >/dev/null
     fi
 
     add_path_line "${PYTHON_VENV}/bin"
@@ -1057,6 +1174,7 @@ TOOLS=(
     assetfinder anew subfaster findomain
     waymore paramspider wafw00f trufflehog
     gf nuclei notify ffuf feroxbuster
+    arjun x8 gitleaks sisakulint dalfox
     talon
 )
 
@@ -1069,6 +1187,12 @@ for tool in "${TOOLS[@]}"; do
         # Opt-in features (--vhost-fuzz/--dir-brute) — missing binary
         # doesn't block a default run, so it's a warning, not a failure.
         printf '  %b!%b %-12s %s\n' "$YELLOW" "$RESET" "$tool" "NOT FOUND (only needed for --vhost-fuzz/--dir-brute)"
+    elif [[ "$tool" == "arjun" || "$tool" == "x8" ]]; then
+        printf '  %b!%b %-12s %s\n' "$YELLOW" "$RESET" "$tool" "NOT FOUND (only needed for --param-fuzz)"
+    elif [[ "$tool" == "gitleaks" || "$tool" == "sisakulint" ]]; then
+        printf '  %b!%b %-12s %s\n' "$YELLOW" "$RESET" "$tool" "NOT FOUND (only needed for --github-recon)"
+    elif [[ "$tool" == "dalfox" ]]; then
+        printf '  %b!%b %-12s %s\n' "$YELLOW" "$RESET" "$tool" "NOT FOUND (only needed for --xss-confirm)"
     else
         printf '  %b\xE2\x9C\x97%b %-12s %s\n' "$RED" "$RESET" "$tool" "NOT FOUND"
         FAILED=1

@@ -10,6 +10,7 @@ rolling its own.
 import csv
 import json
 import logging
+import re
 import subprocess
 import sys
 import threading
@@ -195,6 +196,38 @@ def which_or_die(tools):
         die(f"Missing required tool(s) on PATH: {', '.join(missing)}")
 
 
+_SENSITIVE_HEADER_RE = re.compile(r"^(cookie|authorization)\s*:\s*.*$", re.IGNORECASE)
+
+
+def redact_for_log(cmd) -> str:
+    """Renders a subprocess argv for debug logging with any Cookie/
+    Authorization header VALUE masked. --cookie/--bearer/--auth-file flow
+    into -H 'Cookie: ...' / -H 'Authorization: Bearer ...' strings the same
+    way every other header does (see header_args()) — without this,
+    --verbose would print a live session token in cleartext into the
+    terminal and any redirected log file. Shell-string calls (cmd as str)
+    are passed through unredacted — nothing in this codebase builds a pipe
+    chain containing a raw auth header, every one of those goes through
+    header_args() into an exec-form list instead."""
+    if isinstance(cmd, str):
+        return cmd
+    parts = list(cmd)
+    out = []
+    i = 0
+    while i < len(parts):
+        out.append(parts[i])
+        if parts[i] in ("-H", "--header") and i + 1 < len(parts):
+            value = parts[i + 1]
+            if _SENSITIVE_HEADER_RE.match(value):
+                name = value.split(":", 1)[0]
+                out.append(f"{name}: ***REDACTED***")
+            else:
+                out.append(value)
+            i += 1
+        i += 1
+    return " ".join(out)
+
+
 def run(cmd, **kw):
     """Shell out. `cmd` is either a list (exec form) or a string (pipe chain).
     Pipe chains only ever interpolate fixed filenames/constants we control —
@@ -208,7 +241,7 @@ def run(cmd, **kw):
     is always correct — except when the caller passes `input=`,
     subprocess.run rejects that combined with an explicit `stdin=` (it
     needs stdin free to build the pipe it writes `input` into)."""
-    log.debug("RUN: %s", cmd if isinstance(cmd, str) else " ".join(cmd))
+    log.debug("RUN: %s", redact_for_log(cmd))
     shell = isinstance(cmd, str)
     if "input" not in kw:
         kw.setdefault("stdin", subprocess.DEVNULL)

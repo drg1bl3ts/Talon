@@ -34,6 +34,7 @@ Author: Dan
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -48,6 +49,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
+import cloud_recon
+import creds
+import github_recon
 import recon
 from talon_common import (
     RESET, BOLD, DIM, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN,
@@ -272,6 +276,43 @@ def classify_ssrf_sinks(triage_dir: Path, alive_path: Path) -> list[str]:
         if current is None or ("FUZZ" in current and "FUZZ" not in line):
             by_signature[sig] = line
     return sorted(by_signature.values())
+
+
+# SAML/OIDC/SSO (already shared with KNOWN_SSRF_SINK_PATTERNS above — a SAML
+# ACS callback is also a classic SSRF sink) plus MFA-adjacent paths. Passive
+# detection ONLY: Talon surfaces these for manual review, same treatment as
+# idor/rce, and does not attempt signature-stripping or workflow-skip
+# bypasses against a live auth endpoint — that's a real exploit attempt
+# against production auth, not recon, and needs a human decision per target.
+AUTH_SURFACE_PATTERNS = [re.compile(p, re.IGNORECASE) for p in (
+    r"/(saml|oidc|sso)/",
+    r"\bacs\b",
+    r"/(mfa|2fa|otp|totp|webauthn)\b",
+    r"/verify(-code|-otp)?\b",
+)]
+
+
+def classify_auth_surface(endpoints_path: Path, dirbrute_hits: list[str], vhost_hits: list[str]) -> list[str]:
+    """Flags SAML/OIDC/SSO and MFA-adjacent endpoints found during crawl,
+    dir-brute, and vhost-fuzz as their own manual-review category. See
+    AUTH_SURFACE_PATTERNS' docstring note above — this is detection only."""
+    candidates: set[str] = set()
+    if endpoints_path.exists():
+        for line in endpoints_path.read_text(errors="ignore").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            path = urlparse(line if "://" in line else f"https://{line}").path
+            if any(pat.search(path) for pat in AUTH_SURFACE_PATTERNS):
+                candidates.add(line)
+    for hit in dirbrute_hits:
+        url = hit.split(" [", 1)[0]
+        if any(pat.search(urlparse(url).path) for pat in AUTH_SURFACE_PATTERNS):
+            candidates.add(url)
+    for host in vhost_hits:
+        if any(pat.search(host) for pat in AUTH_SURFACE_PATTERNS):
+            candidates.add(host)
+    return sorted(candidates)
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -526,6 +567,120 @@ def fingerprint_cms_versions(endpoints_path: Path, cms_by_host: dict[str, str], 
 
     return versions
 
+
+# Curated mapping from detected product name (cms_by_host values, plus the
+# handful of tech_by_host labels worth checking) to endoflife.date's own API
+# slug. Deliberately small and extendable, same spirit as
+# _WP_PLUGIN_DISPLAY_NAMES above — not an attempt at covering every product
+# endoflife.date tracks.
+PRODUCT_EOL_SLUGS = {
+    "wordpress": "wordpress",
+    "drupal": "drupal",
+    "joomla": "joomla",
+    "nginx": "nginx",
+    "apache": "apache",
+    "apache-httpd": "apache",
+    "php": "php",
+    "openssl": "openssl",
+    "mysql": "mysql",
+    "postgresql": "postgresql",
+    "postgres": "postgresql",
+}
+
+_EOL_API_CACHE: dict[str, list[dict] | None] = {}
+
+
+def _fetch_eol_cycles(slug: str, timeout: int = 15) -> list[dict] | None:
+    """One cached GET per unique product slug — a 50-host WordPress fleet
+    costs one request, not fifty. Returns None (not []) on any failure
+    (network, 404 for an unrecognized slug, bad JSON) so the caller can
+    tell "no EOL data available" apart from "checked, nothing EOL"."""
+    if slug in _EOL_API_CACHE:
+        return _EOL_API_CACHE[slug]
+    import urllib.error
+    import urllib.request
+    result = None
+    try:
+        req = urllib.request.Request(
+            f"https://endoflife.date/api/{slug}.json",
+            headers={"User-Agent": "Talon-EOL-Check/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = json.loads(resp.read().decode("utf-8", "ignore"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        result = None
+    _EOL_API_CACHE[slug] = result
+    return result
+
+
+def eol_check(cms_by_host: dict[str, str], cms_versions: dict[str, dict[str, str]],
+              tech_by_host: dict[str, list[str]]) -> list[dict]:
+    """Cross-references every detected product+version against
+    endoflife.date. Flags anything already end-of-life or due within 90
+    days — a cheap, high-signal check (one cached API call per unique
+    product) Talon previously had no equivalent of: it fingerprints
+    versions (fingerprint_cms_versions) but never told you whether the
+    version it found is actually still supported.
+
+    Returns a list of {"host", "product", "version", "eol_date",
+    "status"} dicts — status is "eol" (past eol date) or
+    "near-eol" (within 90 days). Products with no PRODUCT_EOL_SLUGS entry,
+    or no version detected, are silently skipped (not a finding either
+    way) rather than guessed at."""
+    from datetime import date
+
+    findings: list[dict] = []
+    # host -> {product_name: version} — reuses cms_versions' own per-host
+    # shape; tech_by_host's plain name list has no version info at all, so
+    # it can only ever confirm a product is PRESENT, never check EOL for
+    # it — deliberately not attempted here (same "don't fabricate
+    # confidence" discipline as fingerprint_cms_versions' Magento note).
+    per_host_versions: dict[str, dict[str, str]] = {}
+    for host, versions in cms_versions.items():
+        per_host_versions.setdefault(host, {}).update(versions)
+
+    today = date.today()
+    for host, versions in per_host_versions.items():
+        for product, version in versions.items():
+            slug = PRODUCT_EOL_SLUGS.get(product.lower())
+            if not slug or not version:
+                continue
+            cycles = _fetch_eol_cycles(slug)
+            if not cycles:
+                continue
+            # endoflife.date's "cycle" field is usually the major/minor
+            # (e.g. "6.4" for WordPress 6.4.2) — match the longest cycle
+            # string that's a prefix of the detected version, same
+            # "most-specific-match-wins" approach as picking a CSS rule.
+            best_cycle = None
+            for c in cycles:
+                cycle_str = str(c.get("cycle", ""))
+                if cycle_str and version.startswith(cycle_str):
+                    if best_cycle is None or len(cycle_str) > len(str(best_cycle.get("cycle", ""))):
+                        best_cycle = c
+            if not best_cycle:
+                continue
+            eol_value = best_cycle.get("eol")
+            if not isinstance(eol_value, str):
+                continue  # eol:false (still supported) or eol:true-with-no-date — nothing dated to compare
+            try:
+                eol_date = date.fromisoformat(eol_value)
+            except ValueError:
+                continue
+            days_remaining = (eol_date - today).days
+            if days_remaining < 0:
+                status = "eol"
+            elif days_remaining <= 90:
+                status = "near-eol"
+            else:
+                continue
+            findings.append({
+                "host": host, "product": product, "version": version,
+                "eol_date": eol_value, "status": status,
+            })
+    return findings
+
+
 # The warm-up itself is just `curl -x <proxy>` — mechanically identical for
 # Caido and Burp Suite, and both default to listening on this same address,
 # so there's no separate --proxy-address flag to keep in sync. The only
@@ -575,6 +730,14 @@ RECOMMENDATIONS = {
     "graphql": "GraphQL endpoint and/or a dev-tool exposure (GraphiQL/Playground/Voyager) or misconfig (alias/array batching, GET-method bypass, field-suggestion leak) flagged. This is detection/misconfig only — hand off to the `graphql-hunter` agent for actual introspection, query-depth/batching abuse, and authorization testing.",
     "smuggling": "Nuclei's differential CL.TE/TE.CL probes flagged a timing/response discrepancy consistent with HTTP request smuggling — high-impact if real, but these probes are inherently noisy (load balancers, WAFs, and some CDNs produce the same signal without being exploitable). Confirm manually before trusting it: replay the same differential request a few times for consistency, then escalate to a dedicated smuggling workflow (queue desync via a second, victim-simulating request) rather than relying on nuclei's single-shot result alone.",
     "cookies": "Session cookie missing Secure/HttpOnly/SameSite=Strict. Not CSRF detection itself (that needs per-form token presence, which this pipeline doesn't parse for) — but missing SameSite is a CSRF-adjacent gap, and missing Secure/HttpOnly widen session-hijacking risk (MITM capture, XSS-driven cookie theft) if any XSS/mixed-content finding elsewhere in this report is real. Worth a line in the report even where it's not independently bounty-worthy.",
+    "auth_surface": "SAML/OIDC/SSO or MFA-adjacent endpoint found during crawl/dir-brute/vhost-fuzz. Talon does NOT attempt signature-stripping, assertion forgery, or workflow-skip bypasses here — that's a live exploit attempt against production auth, a per-target human decision, not an automated default. Manually: for SAML, check whether the SP validates the assertion signature at all (strip it, or swap to an unsigned assertion) and whether NameID/audience restriction is enforced; for MFA-adjacent paths, check whether the post-auth endpoint is reachable by direct URL without completing the MFA step (workflow-skip).",
+    "hidden_params": "Found by arjun/x8 (`--param-fuzz`) — a real parameter the app accepts that never showed up in any crawled/historical URL. Not a vuln class on its own; fuzz each one by hand in {replay} for the full range of classes above (it's new attack surface, not a confirmed bug).",
+    "eol": "Detected product version is end-of-life or within 90 days of it (endoflife.date). No CVE lookup performed here — hand off to `vuln-scanner` for the actual CVE list against this specific version; an EOL version with no public CVE isn't itself a finding, it's a prioritization signal for where to look first.",
+    "cloud_exposure": "Candidate cloud storage bucket (S3/GCS/Azure) responded as publicly listable or confirmed-exists. Bucket names here are GUESSED from the apex domain and discovered subdomains, NOT drawn from the scope-filtered host list — confirm the bucket is actually owned by the in-scope org (check listed object names/paths for the target's own branding/data) before reporting; a same-named bucket owned by an unrelated third party is a real false-positive risk this guessing approach can hit.",
+    "secrets_git": "gitleaks match in a `--github-recon`-cloned public repository. Same discipline as js_secrets: check surrounding context (test fixtures, example configs, rotated/placeholder values) before trusting a match as live. Unlike js_secrets, there's no live-verification API call here — treat every hit as unverified until you check it by hand or confirm the credential authenticates.",
+    "cicd": "sisakulint flagged a GitHub Actions workflow misconfiguration (common classes: script injection via untrusted `${{ }}` expansion in a `run:` step, overly broad `pull_request_target` trigger combined with checkout of the PR head, excessive `permissions:` scope, unpinned third-party actions by tag instead of SHA). Hand off to `cicd-redteam` for exploitation methodology specific to the flagged class.",
+    "bypass_403": "Talon's own fixed bypass matrix (case variation, X-Original-URL, X-Rewrite-URL, X-Forwarded-For, double-encoding) found a status or response-size difference against a path `--dir-brute` found blocked. Verify manually before trusting it — a case-variant path (`/ADMIN` vs `/admin`) can return a different status purely from routing/case-sensitivity differences without actually bypassing access control. The header-based bypasses (X-Original-URL, X-Rewrite-URL, X-Forwarded-For) are the ones most likely to be a real backend trust-boundary bug — confirm in {replay} that the bypass URL's response body actually contains the protected content, not just a different status code.",
+    "xss_confirmed": "dalfox (`--xss-confirm`) actually sent the payload and verified it reached an executable position — type V is confirmed exploitable, R is reflected but not fully confirmed, A is a static AST source→sink match (DOM XSS) worth a manual trigger check, I is informational. This is real evidence, not a candidate: grab the `data` field's exact PoC URL and the `payload` field for the report. Does not cover generic stored XSS (needs app-specific inject-point→render-point knowledge) or blind/OOB XSS (run dalfox by hand with `-b`/`--blind-oob` for that).",
 }
 
 # Maps each candidate category to the Claude Code agent/skill best suited
@@ -615,6 +778,14 @@ CLASS_AGENT_MAP = {
     "cookies": {"agent": None, "skill": None, "note": "informational — feeds severity of any real XSS/session finding elsewhere in the run"},
     "waf": {"agent": None, "skill": "bypass-techniques", "note": "vendor-specific bypass guidance, not a hunting target itself"},
     "cms": {"agent": "vuln-scanner", "skill": None, "note": "CVE lookup against the detected name+version"},
+    "auth_surface": {"agent": "api-security", "skill": None, "note": "SAML/OIDC/SSO/MFA endpoint found during crawl — manual review only; Talon does not attempt signature-stripping or workflow-skip bypasses against live auth"},
+    "eol": {"agent": "vuln-scanner", "skill": None, "note": "detected product version is EOL or near-EOL — CVE lookup against the specific version"},
+    "hidden_params": {"agent": "web-hunter", "skill": None, "note": "arjun/x8 found parameters not present in any crawled/historical URL — fuzz by hand same as interestingparams"},
+    "cloud_exposure": {"agent": "cloud-security", "skill": "cloud-infrastructure", "note": "candidate bucket name responded as public/exists — names are GUESSED, not scope-filtered; confirm the asset is actually in-scope before reporting"},
+    "secrets_git": {"agent": None, "skill": "bugbounty-reports", "note": "gitleaks match in a cloned public repo from --github-recon — check surrounding context for dummy/example/test values before trusting it, same discipline as js_secrets"},
+    "cicd": {"agent": "cicd-redteam", "skill": None, "note": "sisakulint flagged a GitHub Actions workflow misconfig in a --github-recon repo"},
+    "bypass_403": {"agent": None, "skill": "bypass-techniques", "note": "Talon's own fixed bypass matrix found a status/size difference against a blocked path — verify manually, a case/routing difference can look like a bypass without actually being one"},
+    "xss_confirmed": {"agent": None, "skill": "bugbounty-reports", "note": "dalfox actually injected the payload and verified reflection/execution (type V/R/A) — a real PoC, not a candidate; straight to reporting after a final by-hand check"},
 }
 
 
@@ -1425,6 +1596,270 @@ def dir_brute(alive_path: Path, triage_dir: Path, rate: int, proxy: str | None,
     return sorted(all_hits)
 
 
+def param_fuzz(alive_path: Path, triage_dir: Path, rate: int, proxy: str | None,
+               headers: list[str] | None, timeout: int = 15) -> Path:
+    """--param-fuzz only (opt-in, same volume/rate-limit tier as
+    --vhost-fuzz/--dir-brute). Runs arjun and x8 against one representative
+    URL per alive host (same "representative host" discipline as
+    waf_detect()) looking for parameters the app accepts that never showed
+    up in any crawled/historical URL — closes a real gap GF/nuclei can't:
+    those only ever triage parameters that are ALREADY in a URL somewhere.
+
+    Writes triage/hidden_params_found.txt (one "host: param" per line,
+    deduped). Both tools are soft-best-effort per host — one timing out or
+    erroring doesn't abort the pass for the rest."""
+    if not alive_path.exists():
+        return triage_dir / "hidden_params_found.txt"
+    hosts_by_apex: dict[str, str] = {}
+    for line in alive_path.read_text(errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        host = line_hostname(line)
+        if not host:
+            continue
+        hosts_by_apex.setdefault(_apex_group(host), line)
+    targets = sorted(hosts_by_apex.values())
+    out_path = triage_dir / "hidden_params_found.txt"
+    if not targets:
+        out_path.touch()
+        return out_path
+
+    # Neither tool speaks httpx's repeated "-H 'Name: Value'" convention —
+    # confirmed against each tool's own --help, not assumed:
+    #   arjun:  --headers "Name: Value\nName2: Value2"  (ONE arg, newline-joined;
+    #           and has NO --proxy flag at all — routed via HTTP_PROXY/HTTPS_PROXY
+    #           env vars instead, which its underlying requests session honors)
+    #   x8:     -H 'Name:Value' 'Name2:Value2'  (one -H, space-separated values;
+    #           --proxy IS a real flag here)
+    # Silently passing header_args()'s httpx-style list to either one made
+    # arjun hard-error ("unrecognized arguments: -H ...") and would have
+    # made --param-fuzz quietly do nothing whenever an auth session
+    # (--cookie/--bearer/--auth-file) was active — caught in this session's
+    # own self-audit, not assumed to be fine.
+    header_list = resolved_headers(headers)
+    arjun_env = dict(os.environ)
+    if proxy:
+        arjun_env["HTTP_PROXY"] = proxy
+        arjun_env["HTTPS_PROXY"] = proxy
+
+    found: set[str] = set()
+    progress = Progress("arjun+x8:param-fuzz")
+    for i, base_url in enumerate(targets, 1):
+        progress.update(f"{i}/{len(targets)} apex host(s)", percent=100 * (i - 1) / len(targets))
+        host = urlparse(base_url).hostname or base_url
+
+        arjun_out = triage_dir / f".arjun_{i}.json"
+        arjun_cmd = ["arjun", "-u", base_url, "-oJ", str(arjun_out), "-t", str(max(1, rate // 5)),
+                     "--rate-limit", str(rate), "-T", str(timeout)]
+        if header_list:
+            arjun_cmd += ["--headers", "\n".join(header_list)]
+        try:
+            subprocess.run(arjun_cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                            timeout=timeout * 20, env=arjun_env)
+        except Exception as e:
+            warn(f"arjun failed against {base_url}: {e}")
+        if arjun_out.exists():
+            try:
+                data = json.loads(arjun_out.read_text())
+                for param in (data.get("params") or []):
+                    found.add(f"{host}: {param}")
+            except (json.JSONDecodeError, AttributeError):
+                pass
+            arjun_out.unlink(missing_ok=True)
+
+        x8_out = triage_dir / f".x8_{i}.json"
+        x8_cmd = ["x8", "-u", base_url, "-o", str(x8_out), "--output-format", "json"]
+        if header_list:
+            x8_cmd += ["-H"] + header_list
+        if proxy:
+            x8_cmd += ["--proxy", proxy]
+        try:
+            subprocess.run(x8_cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout * 20)
+        except Exception as e:
+            warn(f"x8 failed against {base_url}: {e}")
+        if x8_out.exists():
+            try:
+                data = json.loads(x8_out.read_text())
+                entries = data if isinstance(data, list) else [data]
+                for entry in entries:
+                    for param in (entry.get("found_parameters") or entry.get("parameters") or []):
+                        name = param.get("name") if isinstance(param, dict) else param
+                        if name:
+                            found.add(f"{host}: {name}")
+            except (json.JSONDecodeError, AttributeError):
+                pass
+            x8_out.unlink(missing_ok=True)
+    progress.stop(f"{GREEN}[{ts()}] ✓{RESET} param-fuzz complete — {len(found)} hidden parameter(s) across {len(targets)} apex host(s)")
+
+    out_path.write_text("\n".join(sorted(found)) + ("\n" if found else ""))
+    return out_path
+
+
+# Fixed, bounded bypass matrix — deliberately small (a handful of
+# well-documented 403-bypass primitives) rather than an exhaustive fuzz
+# list, since this only ever runs against URLs already confirmed blocked
+# (--dir-brute's 401/403 hits), not every discovered path.
+def _bypass_403_variants(url: str) -> list[tuple[str, str, dict]]:
+    """Returns (label, variant_url, extra_headers) tuples for one blocked
+    URL. Path-shape tricks and header tricks are kept separate (a header
+    trick reuses the original path) since the headers also need per-request
+    application, not just a URL rewrite."""
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    variants = []
+
+    # Path-shape tricks (new URL, no extra headers)
+    def _with_path(new_path: str) -> str:
+        return parsed._replace(path=new_path).geturl()
+
+    if path != path.upper():
+        variants.append(("case: upper", _with_path(path.upper()), {}))
+    if not path.endswith("/"):
+        variants.append(("trailing slash", _with_path(path + "/"), {}))
+    variants.append(("trailing dot", _with_path(path.rstrip("/") + "/."), {}))
+    variants.append(("double slash", _with_path("/" + path.lstrip("/").replace("/", "//", 1)), {}))
+    variants.append(("url-encoded slash", _with_path(path.replace("/", "%2f", 1) if "/" in path.lstrip("/") else path), {}))
+
+    # Header tricks (original path, extra headers)
+    variants.append(("X-Original-URL", url, {"X-Original-URL": path}))
+    variants.append(("X-Rewrite-URL", url, {"X-Rewrite-URL": path}))
+    variants.append(("X-Forwarded-For: localhost", url, {"X-Forwarded-For": "127.0.0.1"}))
+    variants.append(("X-Forwarded-Host: localhost", url, {"X-Forwarded-Host": "localhost"}))
+    return variants
+
+
+def bypass_403(triage_dir: Path, rate: int, proxy: str | None, headers: list[str] | None,
+                timeout: int = 10) -> list[dict]:
+    """--bypass-403 only (opt-in; no-op without --dir-brute already having
+    run — warned about at argument-parsing time). Reads dir_brute()'s own
+    output file (dirbrute_findings.txt already carries every status
+    feroxbuster reports, 401/403 included — no change needed to dir_brute()
+    itself) for blocked hits, then retries each one with a bounded bypass
+    matrix (_bypass_403_variants), flagging any variant whose status code
+    differs from the original block or whose response size differs
+    meaningfully (>10%) from the block page's own size — either signal
+    means the variant reached something the direct request didn't.
+
+    Writes triage/bypass_403_findings.json. Returns the successful-bypass
+    list (empty if dirbrute_findings.txt has no 401/403 entries, or
+    nothing bypassed)."""
+    findings_path = triage_dir / "dirbrute_findings.txt"
+    out_path = triage_dir / "bypass_403_findings.json"
+    if not findings_path.exists():
+        out_path.write_text("[]")
+        return []
+
+    blocked: list[tuple[str, str]] = []  # (url, original_status)
+    for line in findings_path.read_text(errors="ignore").splitlines():
+        line = line.strip()
+        m = re.match(r"^(\S+)\s+\[(\d+)\]$", line)
+        if m and m.group(2) in ("401", "403"):
+            blocked.append((m.group(1), m.group(2)))
+
+    if not blocked:
+        out_path.write_text("[]")
+        return []
+
+    def _probe(url: str, extra_headers: dict) -> tuple[str, int]:
+        cmd = ["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code} %{size_download}",
+               "--max-time", str(timeout), url] + header_args(headers)
+        for name, value in extra_headers.items():
+            cmd += ["-H", f"{name}: {value}"]
+        if proxy:
+            cmd += ["-x", proxy]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout + 10)
+            parts = (proc.stdout or "0 0").split()
+            return parts[0], int(parts[1]) if len(parts) > 1 else 0
+        except (subprocess.TimeoutExpired, ValueError, IndexError):
+            return "0", 0
+
+    results: list[dict] = []
+    progress = Progress("bypass-403:retry")
+    for i, (url, orig_status) in enumerate(blocked, 1):
+        progress.update(f"{i}/{len(blocked)} blocked URL(s)", percent=100 * (i - 1) / len(blocked))
+        _, baseline_size = _probe(url, {})
+        for label, variant_url, extra_headers in _bypass_403_variants(url):
+            status, size = _probe(variant_url, extra_headers)
+            size_delta = abs(size - baseline_size) / baseline_size if baseline_size else (1.0 if size else 0.0)
+            if status not in ("0", orig_status) or size_delta > 0.10:
+                results.append({
+                    "original_url": url, "original_status": orig_status,
+                    "bypass": label, "bypass_url": variant_url,
+                    "bypass_status": status, "size_delta_pct": round(size_delta * 100, 1),
+                })
+        time.sleep(1.0 / max(rate, 1))
+    progress.stop(f"{GREEN}[{ts()}] ✓{RESET} bypass-403:retry complete — {len(results)} potential bypass(es) across {len(blocked)} blocked URL(s)")
+
+    out_path.write_text(json.dumps(results, indent=2))
+    return results
+
+
+def xss_confirm(triage_dir: Path, rate: int, proxy: str | None, headers: list[str] | None,
+                 timeout: int = 10) -> list[dict]:
+    """--xss-confirm only (opt-in). Runs dalfox (v3, Rust — github.com/hahwul/dalfox;
+    NOT the older v2 Go line, which the project's own docs call a
+    security-backports-only branch now) in file-input mode against
+    xss_candidates.txt, actually injecting payloads and verifying
+    reflection/DOM execution rather than nuclei's generic-marker pass —
+    closes the exact gap RECOMMENDATIONS["xss"] already names ("context-
+    aware encoding nuclei's generic payloads don't try").
+
+    Each dalfox finding is typed V (vulnerable — confirmed exploitable),
+    R (reflected, unconfirmed), A (AST-based DOM-XSS source→sink match), or
+    I (informational) — all four are kept here; callers filter by `type`
+    if they only want confirmed hits.
+
+    Does NOT cover generic stored XSS — confirming that needs knowing the
+    specific inject-point -> render-point relationship in this app, which
+    dalfox's own --sxss mode asks for explicitly via --sxss-url rather
+    than claiming to discover it unaided. Its blind/OOB mode (-b/
+    --blind-oob — plant a payload, get a callback whenever/wherever it
+    fires, the closest generic approximation to stored-XSS discovery)
+    isn't wired here either; run dalfox by hand with a callback domain for
+    that, this function only automates the directly-confirmable case.
+
+    Writes triage/dalfox_findings.json. Returns [] (not an error) if
+    xss_candidates.txt doesn't exist or is empty — most commonly because
+    the vulnerability-class filter excluded xss this run."""
+    candidates_path = triage_dir / "xss_candidates.txt"
+    out_path = triage_dir / "dalfox_findings.json"
+    if not candidates_path.exists() or count_lines(candidates_path) == 0:
+        out_path.write_text(json.dumps({"findings": []}))
+        return []
+
+    cmd = [
+        "dalfox", "scan", "--input-type", "file", str(candidates_path),
+        "-f", "json", "-o", str(out_path), "-S",
+        "--rate-limit", str(rate), "--timeout", str(timeout), "--scan-timeout", "300",
+    ]
+    if proxy:
+        cmd += ["--proxy", proxy]
+    for h in resolved_headers(headers):
+        cmd += ["-H", h]
+
+    # Not run_with_spinner(): dalfox exits non-zero when it FINDS xss (a
+    # common scanner convention, same as grep) — that would misrender a
+    # successful scan as a warning. Success/failure here is judged by
+    # whether the JSON report parses, not the exit code.
+    progress = Progress("dalfox:xss-confirm")
+    try:
+        subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        progress.stop(f"{YELLOW}[{ts()}] !{RESET} dalfox:xss-confirm failed to run: {e}")
+        return []
+
+    findings = []
+    if out_path.exists():
+        try:
+            findings = json.loads(out_path.read_text()).get("findings", [])
+        except json.JSONDecodeError:
+            pass
+    progress.stop(f"{GREEN}[{ts()}] ✓{RESET} dalfox:xss-confirm complete — {len(findings)} finding(s)")
+    return findings
+
+
 def naabu_service_triage(outdir: Path, triage_dir: Path, nuclei_dir: Path, rate: int,
                           headers: list[str] | None, candidate_classes: list, skip_confirm: bool) -> list[dict]:
     """Labels naabu.txt (currently write-only — recon.py writes it, nothing
@@ -1671,7 +2106,9 @@ def _quick_reference_section(
     triage_dir: Path, gf_counts: dict, waf_findings: list, tech_by_host: dict, port_findings: list,
     ssrf_sink_hits: list | None = None, cms_versions: dict | None = None, xmlrpc_findings: list | None = None,
     cms_by_host: dict | None = None, vhost_hits: list | None = None, dirbrute_hits: list | None = None,
-    graphql_findings: list | None = None,
+    graphql_findings: list | None = None, eol_findings: list | None = None, auth_surface_hits: list | None = None,
+    hidden_params: list | None = None, cloud_findings: list | None = None, bypass_403_findings: list | None = None,
+    xss_confirmed_findings: list | None = None,
 ) -> list[str]:
     """The consolidated top-of-report block: WAF/CDN, tech stack, ports of
     interest, and SSRF signal-vs-noise — the exact manual cross-referencing
@@ -1741,6 +2178,35 @@ def _quick_reference_section(
         gql_urls = sorted({f["matched_at"] for f in graphql_findings if f.get("matched_at")})
         lines.append(f"**GraphQL:** {len(gql_urls)} host(s) — {', '.join(gql_urls)} (see Recommendations by Class → graphql, and the `graphql-hunter` agent for follow-up)")
 
+    eol_findings = eol_findings or []
+    if eol_findings:
+        parts = [f"{f['host']}: {f['product']} {f['version']} ({f['status']}, eol {f['eol_date']})" for f in eol_findings]
+        lines.append(f"**EOL/lifecycle:** {len(eol_findings)} — {'; '.join(parts)}")
+
+    auth_surface_hits = auth_surface_hits or []
+    if auth_surface_hits:
+        lines.append(f"**Auth surface (SAML/OIDC/MFA):** {len(auth_surface_hits)} endpoint(s) — manual review only, see `auth_surface` in Recommendations by Class (`triage/auth_surface_candidates.txt`)")
+
+    hidden_params = hidden_params or []
+    if hidden_params:
+        lines.append(f"**Hidden parameters (arjun/x8):** {len(hidden_params)} found not present in any crawled URL — see `triage/hidden_params_found.txt`")
+
+    cloud_findings = cloud_findings or []
+    if cloud_findings:
+        public = [f for f in cloud_findings if f["status"] == "public-listing"]
+        lines.append(f"**Cloud exposure (guessed names, NOT scope-filtered):** {len(cloud_findings)} candidate(s) exist — {len(public)} publicly listable. Confirm ownership before reporting (see `cloud_exposure` note).")
+        for f in public:
+            lines.append(f"- `{f['provider']}` {f['name']} — {f['url']}")
+
+    bypass_403_findings = bypass_403_findings or []
+    if bypass_403_findings:
+        lines.append(f"**403 bypass hits:** {len(bypass_403_findings)} — see `triage/bypass_403_findings.json`")
+
+    xss_confirmed_findings = xss_confirmed_findings or []
+    if xss_confirmed_findings:
+        verified = sum(1 for f in xss_confirmed_findings if f.get("type") == "V")
+        lines.append(f"**XSS confirmed (dalfox):** {len(xss_confirmed_findings)} — {verified} confirmed exploitable (type V), see `xss_confirmed` in Recommendations by Class")
+
     ssrf_raw = gf_counts.get("ssrf", 0)
     ssrf_nuclei = count_lines(triage_dir / "nuclei" / "nuclei_ssrf.jsonl")
     ssrf_sink_hits = ssrf_sink_hits or []
@@ -1795,6 +2261,10 @@ def write_recommendations_md(
     cms_by_host: dict | None = None, vhost_hits: list | None = None, dirbrute_hits: list | None = None,
     headers_findings: list | None = None, hardening_findings: list | None = None, graphql_findings: list | None = None,
     smuggling_findings: list | None = None, cookie_findings: list | None = None,
+    eol_findings: list | None = None, auth_surface_hits: list | None = None, hidden_params: list | None = None,
+    cloud_findings: list | None = None, bypass_403_findings: list | None = None,
+    secrets_git_findings: list | None = None, cicd_findings: list | None = None,
+    credential_prep_path: Path | None = None, xss_confirmed_findings: list | None = None,
 ) -> Path:
     sev = severity_breakdown(findings)
     lines = []
@@ -1808,7 +2278,8 @@ def write_recommendations_md(
     lines.extend(_quick_reference_section(
         triage_dir, gf_counts, waf_findings or [], tech_by_host or {}, port_findings or [], ssrf_sink_hits or [],
         cms_versions or {}, xmlrpc_findings or [], cms_by_host or {}, vhost_hits or [], dirbrute_hits or [],
-        graphql_findings or [],
+        graphql_findings or [], eol_findings or [], auth_surface_hits or [], hidden_params or [],
+        cloud_findings or [], bypass_403_findings or [], xss_confirmed_findings or [],
     ))
 
     if has_prev_run:
@@ -1933,6 +2404,58 @@ def write_recommendations_md(
         lines.append(RECOMMENDATIONS["cookies"].format(**terms))
         for f in cookie_findings:
             lines.append(f"- {f['name']} — {f['matched_at']}")
+    auth_surface_hits = auth_surface_hits or []
+    if auth_surface_hits:
+        lines.append(f"\n### auth_surface ({len(auth_surface_hits)} candidate{'s' if len(auth_surface_hits) != 1 else ''})")
+        lines.append(RECOMMENDATIONS["auth_surface"].format(**terms))
+        for u in auth_surface_hits:
+            lines.append(f"- {u}")
+    hidden_params = hidden_params or []
+    if hidden_params:
+        lines.append(f"\n### hidden_params ({len(hidden_params)} found)")
+        lines.append(RECOMMENDATIONS["hidden_params"].format(**terms))
+        for p in hidden_params:
+            lines.append(f"- {p}")
+    eol_findings = eol_findings or []
+    if eol_findings:
+        lines.append(f"\n### eol ({len(eol_findings)} product/version pair{'s' if len(eol_findings) != 1 else ''})")
+        lines.append(RECOMMENDATIONS["eol"].format(**terms))
+        for f in eol_findings:
+            lines.append(f"- {f['host']}: {f['product']} {f['version']} — {f['status']}, eol {f['eol_date']}")
+    cloud_findings = cloud_findings or []
+    if cloud_findings:
+        lines.append(f"\n### cloud_exposure ({len(cloud_findings)} candidate{'s' if len(cloud_findings) != 1 else ''})")
+        lines.append(RECOMMENDATIONS["cloud_exposure"].format(**terms))
+        for f in cloud_findings:
+            lines.append(f"- `{f['provider']}` {f['name']} — {f['status']} — {f['url']}")
+    secrets_git_findings = secrets_git_findings or []
+    if secrets_git_findings:
+        lines.append(f"\n### secrets_git ({len(secrets_git_findings)} finding{'s' if len(secrets_git_findings) != 1 else ''})")
+        lines.append(RECOMMENDATIONS["secrets_git"].format(**terms))
+        for f in secrets_git_findings:
+            lines.append(f"- {f['repo']}:{f['file']} ({f['rule']}, commit {f['commit'] or '?'})")
+    cicd_findings = cicd_findings or []
+    if cicd_findings:
+        lines.append(f"\n### cicd ({len(cicd_findings)} finding{'s' if len(cicd_findings) != 1 else ''})")
+        lines.append(RECOMMENDATIONS["cicd"].format(**terms))
+        for f in cicd_findings:
+            lines.append(f"- {f['repo']}/{f['file']}:{f['line']} [{f['rule']}] {f['message']}")
+    bypass_403_findings = bypass_403_findings or []
+    if bypass_403_findings:
+        lines.append(f"\n### bypass_403 ({len(bypass_403_findings)} potential bypass{'es' if len(bypass_403_findings) != 1 else ''})")
+        lines.append(RECOMMENDATIONS["bypass_403"].format(**terms))
+        for f in bypass_403_findings:
+            lines.append(f"- {f['original_url']} ({f['original_status']}) → `{f['bypass']}` gave {f['bypass_status']}, size delta {f['size_delta_pct']}%")
+    xss_confirmed_findings = xss_confirmed_findings or []
+    if xss_confirmed_findings:
+        verified = sum(1 for f in xss_confirmed_findings if f.get("type") == "V")
+        lines.append(f"\n### xss_confirmed ({len(xss_confirmed_findings)} finding{'s' if len(xss_confirmed_findings) != 1 else ''}, {verified} confirmed exploitable)")
+        lines.append(RECOMMENDATIONS["xss_confirmed"].format(**terms))
+        for f in xss_confirmed_findings:
+            lines.append(f"- `[{f.get('type', '?')}]` {f.get('param', '?')} — {f.get('data', '')}")
+    if credential_prep_path:
+        lines.append(f"\n## Credential Attack Data-Prep")
+        lines.append(f"\n`--with-credential-attack` ran — see `{credential_prep_path.name}` for the decision package (wordlist/breach-rank/OSINT summary). Data-prep only; no spray was attempted.")
 
     out = triage_dir / "RECOMMENDATIONS.md"
     out.write_text("\n".join(lines) + "\n")
@@ -1944,6 +2467,9 @@ def build_next_steps(
     takeover_findings: list, cors_findings: list, headers_findings: list, hardening_findings: list,
     graphql_findings: list, smuggling_findings: list, cookie_findings: list,
     ssrf_sink_hits: list, waf_findings: list, cms_by_host: dict,
+    eol_findings: list | None = None, auth_surface_hits: list | None = None, hidden_params: list | None = None,
+    cloud_findings: list | None = None, secrets_git_findings: list | None = None, cicd_findings: list | None = None,
+    bypass_403_findings: list | None = None, xss_confirmed_findings: list | None = None,
 ) -> list[dict]:
     """The machine-readable counterpart to RECOMMENDATIONS.md's "Recommendations
     by Class" section — one entry per category that actually has something
@@ -1979,6 +2505,14 @@ def build_next_steps(
     add("cookies", len(cookie_findings), "triage/nuclei/nuclei_cookies.jsonl")
     add("waf", len(waf_findings), "triage/waf_detect.json")
     add("cms", len(cms_by_host), "triage/cmseek/")
+    add("auth_surface", len(auth_surface_hits or []), "triage/auth_surface_candidates.txt")
+    add("hidden_params", len(hidden_params or []), "triage/hidden_params_found.txt")
+    add("eol", len(eol_findings or []), None)
+    add("cloud_exposure", len(cloud_findings or []), None)
+    add("secrets_git", len(secrets_git_findings or []), None)
+    add("cicd", len(cicd_findings or []), None)
+    add("bypass_403", len(bypass_403_findings or []), "triage/bypass_403_findings.json")
+    add("xss_confirmed", len(xss_confirmed_findings or []), "triage/dalfox_findings.json")
 
     # ssrf_sink_hits is a HIGH-CONFIDENCE SUBSET of the "ssrf" entry already
     # added above (via gf_counts), not a separate candidate pool — listed
@@ -2007,6 +2541,10 @@ def write_json_summary(
     takeover_findings: list | None = None, cors_findings: list | None = None,
     headers_findings: list | None = None, hardening_findings: list | None = None, graphql_findings: list | None = None,
     smuggling_findings: list | None = None, cookie_findings: list | None = None,
+    eol_findings: list | None = None, auth_surface_hits: list | None = None, hidden_params: list | None = None,
+    cloud_findings: list | None = None, bypass_403_findings: list | None = None,
+    secrets_git_findings: list | None = None, cicd_findings: list | None = None,
+    credential_prep_path: Path | None = None, xss_confirmed_findings: list | None = None,
 ) -> Path:
     waf_findings = waf_findings or []
     tech_by_host = tech_by_host or {}
@@ -2024,6 +2562,14 @@ def write_json_summary(
     graphql_findings = graphql_findings or []
     smuggling_findings = smuggling_findings or []
     cookie_findings = cookie_findings or []
+    eol_findings = eol_findings or []
+    auth_surface_hits = auth_surface_hits or []
+    hidden_params = hidden_params or []
+    cloud_findings = cloud_findings or []
+    bypass_403_findings = bypass_403_findings or []
+    secrets_git_findings = secrets_git_findings or []
+    cicd_findings = cicd_findings or []
+    xss_confirmed_findings = xss_confirmed_findings or []
 
     summary = {
         "tool": "talon",
@@ -2054,6 +2600,8 @@ def write_json_summary(
             "xmlrpc_findings": xmlrpc_findings,
             "vhost_hits": vhost_hits,
             "dirbrute_hits": dirbrute_hits,
+            "eol_findings": eol_findings,
+            "cloud_findings": cloud_findings,
         },
         "takeover_findings": takeover_findings,
         "cors_findings": cors_findings,
@@ -2062,11 +2610,20 @@ def write_json_summary(
         "graphql_findings": graphql_findings,
         "smuggling_findings": smuggling_findings,
         "cookie_findings": cookie_findings,
+        "auth_surface_hits": auth_surface_hits,
+        "hidden_params": hidden_params,
+        "bypass_403_findings": bypass_403_findings,
+        "secrets_git_findings": secrets_git_findings,
+        "cicd_findings": cicd_findings,
+        "xss_confirmed_findings": xss_confirmed_findings,
+        "credential_prep_summary": str(credential_prep_path) if credential_prep_path else None,
         "next_steps": build_next_steps(
             triage_dir, gf_counts, dangerous_count, secret_findings,
             takeover_findings, cors_findings, headers_findings, hardening_findings,
             graphql_findings, smuggling_findings, cookie_findings,
             ssrf_sink_hits, waf_findings, cms_by_host,
+            eol_findings, auth_surface_hits, hidden_params, cloud_findings,
+            secrets_git_findings, cicd_findings, bypass_403_findings, xss_confirmed_findings,
         ),
         "new_since_last_run": {
             "has_previous_run": has_prev_run,
@@ -2130,6 +2687,57 @@ def determine_target_and_label(target: str | None, list_file: str | None) -> tup
     return outdir_target, label
 
 
+def _session_hash(headers: list[str]) -> str:
+    """12-char sha256 prefix of the resolved header set — same idea as
+    bughunter's session_id: lets you correlate which identity a run used
+    without ever writing the actual cookie/token value anywhere."""
+    material = "\n".join(sorted(headers)).encode()
+    return hashlib.sha256(material).hexdigest()[:12]
+
+
+def resolve_auth_headers(args) -> list[str]:
+    """Merges --auth-file / --cookie / --bearer into args.headers — the
+    exact same list every active-request function already threads through
+    via header_args() (recon.run_full_recon, every nuclei pass, vhost_fuzz,
+    dir_brute, proxy_warmup, ...). Because that plumbing already exists,
+    auth support needed ZERO other call-site changes: anything downstream
+    of this function becomes auth-aware for free.
+
+    Merge order (each layer can add to or override the one before it):
+    1. --auth-file's own "headers" dict
+    2. --auth-file's "cookie"/"bearer" keys
+    3. --cookie / --bearer flags
+    4. whatever -H/--header the user also passed directly
+
+    Most paying bugs sit behind a login — without this, Talon can only
+    ever see what's reachable logged out."""
+    merged: list[str] = []
+    if args.auth_file:
+        path = Path(args.auth_file)
+        if not path.exists():
+            die(f"--auth-file not found: {args.auth_file}")
+        try:
+            data = json.loads(path.read_text())
+        except json.JSONDecodeError as e:
+            die(f"--auth-file is not valid JSON: {e}")
+        for name, value in (data.get("headers") or {}).items():
+            merged.append(f"{name}: {value}")
+        if data.get("cookie"):
+            merged.append(f"Cookie: {data['cookie']}")
+        if data.get("bearer"):
+            merged.append(f"Authorization: Bearer {data['bearer']}")
+    if args.cookie:
+        merged.append(f"Cookie: {args.cookie}")
+    if args.bearer:
+        merged.append(f"Authorization: Bearer {args.bearer}")
+    merged.extend(args.headers)
+
+    if args.cookie or args.bearer or args.auth_file:
+        info(f"Auth session active — {len(merged)} header(s) total (session_id={_session_hash(merged)}) — "
+             f"recon/triage will see authenticated-only surface")
+    return merged
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Talon - Standalone Parameter & Vulnerability Triage Engine",
@@ -2146,63 +2754,83 @@ def main():
             "  talon.py -t example.com --proxy caido   # warm up Caido's Sitemap with the manual queue\n"
             "  talon.py -t example.com --proxy burp   # same, worded for Burp Suite instead\n"
             "  talon.py -t example.com --ssrf --lfi   # only triage these vuln classes\n"
+            "  talon.py -t example.com --bearer eyJhbGciOi...   # authenticated recon/triage\n"
+            "  talon.py -t example.com --auth-file session.json   # cookie+bearer+extra headers from a file\n"
+            "  talon.py -t example.com --dir-brute --bypass-403   # retry any 401/403 hits with a bypass matrix\n"
+            "  talon.py -t example.com --param-fuzz   # arjun+x8 hidden-parameter discovery\n"
+            "  talon.py -t example.com --xss-confirm   # dalfox: actually confirm reflected/DOM XSS\n"
+            "  talon.py -t example.com --no-nuclei-fuzz --param-fuzz --xss-confirm   # skip nuclei's fuzz pass, use the tooling instead\n"
+            "  talon.py -t example.com --github-recon my-org   # gitleaks + sisakulint against public repos\n"
+            "  talon.py -t example.com --with-credential-attack   # wordlist/OSINT/breach-rank data-prep only\n"
         ),
     )
     target_group = parser.add_mutually_exclusive_group(required=True)
-    target_group.add_argument("-t", "--target", default=None, help="Single target domain (e.g. example.com — runs the full subfinder-and-friends subdomain sweep), or a single full URL (e.g. https://www.example.com — skips subdomain discovery entirely and narrows scope to that exact host, no subdomains)")
-    target_group.add_argument("-l", "--list", dest="list_file", default=None, help="File with one domain per line (multi-target), or a HackerOne scope CSV export (detected by .csv extension)")
-    parser.add_argument("--skip-recon", action="store_true", help="Skip Talon's own recon pipeline; use an existing results dir")
+    target_group.add_argument("-t", "--target", default=None, help="Target domain, or a full URL to scope to that exact host")
+    target_group.add_argument("-l", "--list", dest="list_file", default=None, help="Domain list file, or a HackerOne/Bugcrowd scope CSV")
+    parser.add_argument("--skip-recon", action="store_true", help="Reuse an existing results dir instead of re-running recon")
     parser.add_argument("--indir", default=None, help="Custom output dir (default: results/<target> or $OUTDIR)")
-    parser.add_argument("--param-jobs", type=int, default=5, help="Parallel paramspider workers during recon (default: 5)")
-    parser.add_argument("--scope-file", default=None, help="One in-scope domain per line (apex or subdomain), or a HackerOne scope CSV export (detected by .csv extension). Filters every URL/host list before any of it gets fuzzed, JS-scanned, or routed through the proxy warm-up.")
-    parser.add_argument("--rate", type=int, default=50, help="nuclei -rate-limit (default: 50)")
+    parser.add_argument("--param-jobs", type=int, default=5, help="Parallel paramspider workers (default: 5)")
+    parser.add_argument("--scope-file", default=None, help="Domain allowlist or scope CSV — filters every URL/host list before anything runs")
+    parser.add_argument("--rate", type=int, default=50, help="nuclei/httpx rate limit, req/s (default: 50)")
     parser.add_argument(
         "-H", "--header", dest="headers", action="append", default=[],
-        metavar="'Name: Value'",
-        help="Custom header added to every live HTTP request Talon makes — recon (httpx/katana), "
-             "triage (httpx/nuclei), and the proxy warm-up (curl). Repeatable. "
-             "e.g. -H 'X-HackerOne-Researcher: yourname'",
+        metavar="'Name: Value'", help="Custom header on every request. Repeatable",
+    )
+    parser.add_argument(
+        "--cookie", default=None, metavar="'name=value; name2=value2'",
+        help="Session cookie (shorthand for -H 'Cookie: ...')",
+    )
+    parser.add_argument("--bearer", default=None, metavar="TOKEN", help="Bearer token (shorthand for -H 'Authorization: Bearer ...')")
+    parser.add_argument(
+        "--auth-file", default=None, metavar="FILE.json",
+        help="JSON {cookie, bearer, headers}, merged before --cookie/--bearer/-H",
     )
     parser.add_argument(
         "--proxy", choices=sorted(PROXY_TOOLS), default=None,
-        help="Route the manual-review queue through this proxy tool's warm-up (curl -x http://127.0.0.1:8080 — "
-             "Caido and Burp Suite both default to that same address, so no separate address flag exists). "
-             "Also picks the wording used in progress messages and RECOMMENDATIONS.md (Caido Replay/Sitemap vs "
-             "Burp Repeater/HTTP history). Omit to skip the warm-up entirely (default).",
+        help="caido or burp — warm up the manual queue through that proxy",
     )
-    parser.add_argument("--proxy-timeout", type=int, default=10, help="Per-request curl --max-time for the proxy warm-up (default: 10)")
-    parser.add_argument("--proxy-delay", type=float, default=None, help="Delay between proxy warm-up requests, seconds (default: derived from --rate, so the warm-up never exceeds the same requests/sec ceiling as everything else)")
-    parser.add_argument("--no-js-scan", action="store_true", help="Skip fetching JS files and scanning them for hardcoded secrets")
-    parser.add_argument("--no-secret-verify", action="store_true", help="Skip trufflehog's live verification (real API calls confirming whether a found credential currently authenticates) — secrets are still detected, just not confirmed live. On by default because a confirmed-live credential is unambiguously worth knowing; opt out for a program that restricts using a found credential even to verify it, or to avoid the outbound third-party API calls entirely.")
-    parser.add_argument("--no-host-scan", action="store_true", help="Skip the all-host severity:critical CVE/misconfig sweep (the slow one — ~1,870 templates x every alive host). CORS, takeover, and per-class fuzzing passes still run.")
-    parser.add_argument("--max-candidates", type=int, default=None, help="Cap each fuzz class's deduped candidate list to this many (random sample) before nuclei scans it — bounds worst-case runtime against a URL-rich target instead of scanning every unique injection point found. Default: unlimited.")
-    parser.add_argument("--no-waf-detect", action="store_true", help="Skip the wafw00f WAF/CDN detection pass (one representative host per apex domain, ~2 requests each — fast, but skippable if wafw00f isn't installed or you already know the WAF)")
-    parser.add_argument("--no-port-triage", action="store_true", help="Skip the nuclei network-protocol confirmation pass for naabu-discovered ports (the static port->service labeling and Quick Reference cross-referencing still run — only the extra nuclei -pt tcp scan is skipped)")
-    parser.add_argument("--no-cms-probe", action="store_true", help="Skip the xmlrpc.php live check on WordPress-detected hosts (CMS/plugin version fingerprinting from already-crawled ?ver= query strings still runs — only the one extra live request per WP host, checking for pingback.ping exposure, is skipped)")
-    parser.add_argument("--vhost-fuzz", action="store_true", help="Opt-in: fuzz for virtual hosts via ffuf (Host: header fuzzing against SecLists' Discovery/DNS wordlist), one apex per representative host. OFF by default — this is thousands of requests per apex, a much higher volume than anything else in this pipeline, and aggressive WAFs WILL rate-limit-block you over it (confirmed twice this session on two different targets from exactly this kind of under-throttled scanning). Respects --rate and --proxy.")
-    parser.add_argument("--dir-brute", action="store_true", help="Opt-in: recursive directory/file brute-force via feroxbuster (SecLists' Discovery/Web-Content/common.txt), per alive/in-scope host. OFF by default — same high-volume, rate-limit-block risk as --vhost-fuzz. Depth-limited to avoid unbounded recursion on a large site. Respects --rate and --proxy.")
+    parser.add_argument("--proxy-timeout", type=int, default=10, help="Proxy warm-up curl timeout, seconds (default: 10)")
+    parser.add_argument("--proxy-delay", type=float, default=None, help="Delay between proxy warm-up requests (default: derived from --rate)")
+    parser.add_argument("--no-js-scan", action="store_true", help="Skip the JS secret scan")
+    parser.add_argument("--no-secret-verify", action="store_true", help="Detect secrets but skip trufflehog's live verification")
+    parser.add_argument("--no-host-scan", action="store_true", help="Skip the slow all-host CVE sweep (~1,870 templates x every host)")
+    parser.add_argument("--max-candidates", type=int, default=None, help="Cap each class's candidates before nuclei scans them (default: unlimited)")
+    parser.add_argument("--no-waf-detect", action="store_true", help="Skip wafw00f WAF/CDN detection")
+    parser.add_argument("--no-port-triage", action="store_true", help="Skip the nuclei port-confirmation pass")
+    parser.add_argument("--no-cms-probe", action="store_true", help="Skip the live xmlrpc.php check")
+    parser.add_argument("--no-eol-check", action="store_true", help="Skip the endoflife.date version check")
+    parser.add_argument("--no-cloud-recon", action="store_true", help="Skip guessed S3/GCS/Azure bucket probing")
+    parser.add_argument("--vhost-fuzz", action="store_true", help="Opt-in Host-header fuzzing via ffuf (high request volume)")
+    parser.add_argument("--dir-brute", action="store_true", help="Opt-in directory brute-force via feroxbuster (high request volume)")
+    parser.add_argument("--param-fuzz", action="store_true", help="Opt-in hidden-parameter discovery via arjun + x8")
+    parser.add_argument("--xss-confirm", action="store_true", help="Opt-in: confirm reflected/DOM XSS with dalfox against xss_candidates.txt")
+    parser.add_argument("--bypass-403", action="store_true", help="Retry --dir-brute's 401/403 hits with a bypass matrix (needs --dir-brute)")
+    parser.add_argument("--no-nuclei-fuzz", action="store_true", help="Skip nuclei's per-class fuzz pass — GF triage still runs, so --param-fuzz/--xss-confirm/the manual queue are unaffected")
+    parser.add_argument("--github-recon", nargs="?", const="", default=None, metavar="ORG",
+                         help="gitleaks + sisakulint against an org's public repos (guesses org if omitted)")
+    parser.add_argument("--github-max-repos", type=int, default=20, help="Cap repos for --github-recon (default: 20)")
+    parser.add_argument("--with-credential-attack", action="store_true",
+                         help="Wordlist/OSINT/HIBP breach-rank data-prep. Never sprays")
 
     vuln_group = parser.add_argument_group(
         "vulnerability-class filter",
-        "Opt-in: with none of these set, every class below is triaged (today's default behavior), "
-        "including the fixed nuclei misconfiguration checks (cors/headers/hardening/graphql/smuggling/"
-        "cookies/takeover), which otherwise always run regardless of the GF-pattern classes selected. "
-        "Set one or more to restrict gf triage + nuclei fuzzing + the manual queue + those fixed checks "
-        "to just the named classes — e.g. --xss triages ONLY XSS candidates and skips cors/headers/"
-        "hardening/graphql/smuggling/cookies/takeover too; --ssrf --lfi triages only SSRF and LFI "
-        "candidates. Recon itself always runs in full; this only narrows what triage does with its output.",
+        "With none set, every class is triaged (default). Set one or more to restrict gf triage + "
+        "nuclei fuzzing + the manual queue to just those classes — recon itself always runs in full.",
     )
     for cls in FUZZ_CLASSES + MANUAL_CLASSES:
         flag = "--" + cls["slug"].replace("_", "-")
-        vuln_group.add_argument(flag, action="store_true", dest=f"vuln_{cls['slug']}", help=f"Restrict triage to (at least) {cls['slug']} candidates")
+        vuln_group.add_argument(flag, action="store_true", dest=f"vuln_{cls['slug']}", help=f"Restrict to {cls['slug']}")
     for cls in HOSTLEVEL_CLASSES:
         flag = "--" + cls["slug"].replace("_", "-")
-        vuln_group.add_argument(flag, action="store_true", dest=f"vuln_{cls['slug']}", help=f"Restrict triage to (at least) {cls['desc']} (otherwise runs unconditionally, like today)")
+        vuln_group.add_argument(flag, action="store_true", dest=f"vuln_{cls['slug']}", help=f"Restrict to {cls['desc']}")
 
-    parser.add_argument("--discord", action="store_true", help="Send a clean summary to Discord via `notify` when done")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
+    parser.add_argument("--discord", action="store_true", help="Summary via notify on completion")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging (auth header values are always redacted)")
     parser.add_argument("--quiet", action="store_true", help="Suppress the banner")
     args = parser.parse_args()
+    args.headers = resolve_auth_headers(args)
+    if args.bypass_403 and not args.dir_brute:
+        warn("--bypass-403 set without --dir-brute — nothing to retry yet, this run won't find any 401/403 hits to bypass")
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, format="%(message)s")
 
@@ -2242,6 +2870,12 @@ def main():
         required_tools.append("ffuf")
     if args.dir_brute:
         required_tools.append("feroxbuster")
+    if args.param_fuzz:
+        required_tools += ["arjun", "x8"]
+    if args.github_recon is not None:
+        required_tools += ["git", "gitleaks", "sisakulint"]
+    if args.xss_confirm:
+        required_tools.append("dalfox")
     which_or_die(required_tools)
 
     outdir = resolve_outdir(outdir_target, args.indir)
@@ -2349,6 +2983,17 @@ def main():
     if not cms_by_host:
         success("No CMS detected")
 
+    if args.no_eol_check:
+        info("--no-eol-check set — skipping endoflife.date cross-reference")
+        eol_findings = []
+    else:
+        eol_findings = eol_check(cms_by_host, cms_versions, tech_by_host)
+        if eol_findings:
+            for f in eol_findings:
+                warn(f"{f['host']}: {f['product']} {f['version']} is {f['status']} (eol {f['eol_date']})")
+        else:
+            success("No EOL/near-EOL versions detected")
+
     vhost_hits = []
     if args.vhost_fuzz:
         phase("VHOST FUZZING")
@@ -2366,6 +3011,79 @@ def main():
             warn(f"{len(dirbrute_hits)} path(s) found — see triage/dirbrute_findings.txt")
         else:
             success("No additional paths found")
+
+    bypass_403_findings = []
+    if args.bypass_403:
+        phase("403 BYPASS RETRY")
+        bypass_403_findings = bypass_403(triage_dir, args.rate, proxy_url, args.headers)
+        if bypass_403_findings:
+            warn(f"{len(bypass_403_findings)} potential bypass(es) — see triage/bypass_403_findings.json")
+        else:
+            success("No bypasses found (or no 401/403 hits to retry)")
+
+    hidden_params = []
+    if args.param_fuzz:
+        phase("ACTIVE PARAMETER FUZZING")
+        hidden_params_path = param_fuzz(alive_path, triage_dir, args.rate, proxy_url, args.headers)
+        hidden_params = [l.strip() for l in hidden_params_path.read_text(errors="ignore").splitlines() if l.strip()]
+        if hidden_params:
+            warn(f"{len(hidden_params)} hidden parameter(s) found — see triage/hidden_params_found.txt")
+        else:
+            success("No hidden parameters found")
+
+    auth_surface_hits = classify_auth_surface(outdir / "recon" / "endpoints.txt", dirbrute_hits, vhost_hits)
+    if auth_surface_hits:
+        detail(f"{len(auth_surface_hits)} SAML/OIDC/MFA-adjacent endpoint(s) — manual review only, see triage/auth_surface_candidates.txt")
+    (triage_dir / "auth_surface_candidates.txt").write_text(
+        "\n".join(auth_surface_hits) + ("\n" if auth_surface_hits else "")
+    )
+
+    apex = _apex_group(outdir_target if "://" not in (args.target or "") else urlparse(args.target).hostname or outdir_target)
+    cloud_findings = []
+    if args.no_cloud_recon:
+        info("--no-cloud-recon set — skipping guessed S3/GCS/Azure bucket probing")
+    else:
+        phase("CLOUD ASSET RECON")
+        subs_path = outdir / "recon" / "subs.txt"
+        subdomains = subs_path.read_text(errors="ignore").splitlines() if subs_path.exists() else []
+        bucket_names = cloud_recon.candidate_bucket_names(apex, subdomains)
+        cloud_findings = cloud_recon.probe_buckets(bucket_names)
+        if cloud_findings:
+            warn(f"{len(cloud_findings)} candidate cloud bucket(s) exist (guessed names — confirm ownership before reporting, see Quick Reference)")
+        else:
+            success("No candidate cloud buckets found")
+
+    github_org = None
+    github_repos: list[dict] = []
+    secrets_git_findings: list[dict] = []
+    cicd_findings: list[dict] = []
+    if args.github_recon is not None:
+        phase("GITHUB-ORG RECON")
+        github_org = args.github_recon or github_recon.guess_org_from_domain(apex)
+        if not args.github_recon:
+            warn(f"--github-recon given with no org — guessing '{github_org}' from the target domain; pass the real org name if this misses")
+        info("GitHub's unauthenticated API is rate-limited to 60 req/hr — this pass is bounded by --github-max-repos "
+             f"({args.github_max_repos}), but a large org or repeated runs within the hour can still hit it")
+        github_repos = github_recon.list_org_repos(github_org, args.github_max_repos)
+        if github_repos:
+            success(f"{len(github_repos)} public repo(s) found for org '{github_org}'")
+            secrets_git_findings = github_recon.secrets_hunt_git(github_repos)
+            if secrets_git_findings:
+                warn(f"{len(secrets_git_findings)} gitleaks finding(s) across {len(github_repos)} repo(s) — see Recommendations by Class → secrets_git")
+            cicd_findings = github_recon.cicd_scan(github_org, github_repos)
+            if cicd_findings:
+                warn(f"{len(cicd_findings)} sisakulint finding(s) across {len(github_repos)} repo(s) — see Recommendations by Class → cicd")
+        else:
+            warn(f"No public repos found for org '{github_org}' — secrets_git/cicd skipped")
+
+    credential_prep_path = None
+    if args.with_credential_attack:
+        phase("CREDENTIAL ATTACK DATA-PREP")
+        credential_prep_path = creds.run_credential_prep(
+            outdir, apex, github_org=github_org, github_repos=github_repos or None,
+        )
+        success(f"Decision package written: {credential_prep_path}")
+        info("Data-prep only — no spray attempted. See the credential_prep_summary.md for next steps.")
 
     ext_live_count = check_interesting_ext_live(triage_dir, args.rate, args.headers)
     dangerous_count = 0
@@ -2424,13 +3142,30 @@ def main():
     smuggling_findings = parse_nuclei_jsonl([smuggling_out] if smuggling_out else [])
     cookie_out = hostlevel_scan("cookies", nuclei_cookie_scan, "session-cookie hardening (SameSite/HttpOnly/Secure)")
     cookie_findings = parse_nuclei_jsonl([cookie_out] if cookie_out else [])
-    class_outs = nuclei_class_scans(triage_dir, nuclei_dir, args.rate, active_fuzz_classes, args.headers, args.max_candidates)
+    if args.no_nuclei_fuzz:
+        info("--no-nuclei-fuzz set — skipping nuclei's per-class fuzz pass (xss/sqli/ssrf/lfi/ssti/redirect/img-traversal); GF triage candidates still feed --param-fuzz/--xss-confirm/the manual queue")
+        class_outs = []
+    else:
+        class_outs = nuclei_class_scans(triage_dir, nuclei_dir, args.rate, active_fuzz_classes, args.headers, args.max_candidates)
     all_paths = ([host_out] if host_out else []) + [p for _, p in class_outs]
     findings = (
         parse_nuclei_jsonl(all_paths) + cors_findings + headers_findings + hardening_findings
         + graphql_findings + smuggling_findings + cookie_findings
     )
     success(f"nuclei complete — {len(findings)} finding(s)")
+
+    xss_confirmed_findings = []
+    if args.xss_confirm:
+        if any(c["slug"] == "xss" for c in active_fuzz_classes):
+            phase("XSS CONFIRMATION — dalfox")
+            xss_confirmed_findings = xss_confirm(triage_dir, args.rate, proxy_url, args.headers)
+            verified = sum(1 for f in xss_confirmed_findings if f.get("type") == "V")
+            if xss_confirmed_findings:
+                warn(f"{len(xss_confirmed_findings)} dalfox finding(s) — {verified} confirmed exploitable (type V) — see triage/dalfox_findings.json")
+            else:
+                success("No XSS confirmed by dalfox")
+        else:
+            info("--xss-confirm set but xss is excluded by the vulnerability-class filter — skipping")
 
     phase("SUBDOMAIN TAKEOVER CHECK")
     takeover_out = hostlevel_scan("takeover", nuclei_takeover_scan, "subdomain/dangling-CNAME takeover")
@@ -2503,6 +3238,8 @@ def main():
         cms_by_host, vhost_hits, dirbrute_hits,
         headers_findings, hardening_findings, graphql_findings,
         smuggling_findings, cookie_findings,
+        eol_findings, auth_surface_hits, hidden_params, cloud_findings, bypass_403_findings,
+        secrets_git_findings, cicd_findings, credential_prep_path, xss_confirmed_findings,
     )
     json_path = write_json_summary(
         triage_dir, target_label, url_count, gf_counts, ext_live_count, dangerous_count,
@@ -2514,6 +3251,8 @@ def main():
         takeover_findings, cors_findings,
         headers_findings, hardening_findings, graphql_findings,
         smuggling_findings, cookie_findings,
+        eol_findings, auth_surface_hits, hidden_params, cloud_findings, bypass_403_findings,
+        secrets_git_findings, cicd_findings, credential_prep_path, xss_confirmed_findings,
     )
 
     if args.discord:
@@ -2543,6 +3282,19 @@ def main():
         print(f"  {DIM}{'VHOSTS FOUND':<16}{RESET} {BOLD}{len(vhost_hits)}{RESET}")
     if dirbrute_hits:
         print(f"  {DIM}{'DIR BRUTE HITS':<16}{RESET} {BOLD}{len(dirbrute_hits)}{RESET}")
+    if eol_findings:
+        print(f"  {DIM}{'EOL/LIFECYCLE':<16}{RESET} {BOLD}{len(eol_findings)}{RESET}")
+    if cloud_findings:
+        print(f"  {DIM}{'CLOUD EXPOSURE':<16}{RESET} {BOLD}{len(cloud_findings)} (guessed names){RESET}")
+    if auth_surface_hits:
+        print(f"  {DIM}{'AUTH SURFACE':<16}{RESET} {BOLD}{len(auth_surface_hits)}{RESET}")
+    if secrets_git_findings or cicd_findings:
+        print(f"  {DIM}{'GITHUB RECON':<16}{RESET} {BOLD}{len(secrets_git_findings)} secret(s), {len(cicd_findings)} CI/CD finding(s){RESET}")
+    if xss_confirmed_findings:
+        verified = sum(1 for f in xss_confirmed_findings if f.get("type") == "V")
+        print(f"  {DIM}{'XSS CONFIRMED':<16}{RESET} {BOLD}{len(xss_confirmed_findings)} ({verified} exploitable){RESET}")
+    if credential_prep_path:
+        print(f"  {DIM}{'CREDENTIAL PREP':<16}{RESET} {BOLD}{credential_prep_path}{RESET}")
     print(f"  {DIM}{'URLS TRIAGED':<16}{RESET} {BOLD}{url_count}{RESET}")
     verified_secret_count = sum(1 for f in secret_findings if f.get("verified"))
     js_secrets_str = f"{len(secret_findings)}" + (f" ({verified_secret_count} CONFIRMED LIVE)" if verified_secret_count else "")
