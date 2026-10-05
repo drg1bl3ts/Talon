@@ -1539,7 +1539,7 @@ def vhost_fuzz(alive_path: Path, triage_dir: Path, rate: int, proxy: str | None,
 
 def dir_brute(alive_path: Path, triage_dir: Path, rate: int, proxy: str | None,
               headers: list[str] | None, wordlist: Path = DIRBRUTE_WORDLIST, depth: int = 2,
-              timeout: int = 7) -> list[str]:
+              timeout: int = 7, per_host_timeout: int | None = None, job_timeout: int = 3600) -> list[str]:
     """--dir-brute only (opt-in, off by default — same volume/rate-limit-
     risk reasoning as vhost_fuzz(), a full recursive content discovery
     scan is thousands of requests per host, not the 1-2 request footprint
@@ -1550,6 +1550,17 @@ def dir_brute(alive_path: Path, triage_dir: Path, rate: int, proxy: str | None,
     vhost fuzzing which is a property of the web server's vhost config at
     the apex). Depth-limited (default 2) so a large site can't turn this
     into an unbounded recursive crawl.
+
+    Two independent ceilings, same shape as xss_confirm()/param_fuzz()'s:
+    `per_host_timeout` (auto-derived from wordlist size ÷ rate unless
+    given) stops one slow/hung host from blocking the subprocess call
+    forever; `job_timeout` (default 3600s, --dir-brute-timeout) stops
+    once the whole pass's wall clock runs out, instead of plowing through
+    every remaining host — the risk --param-fuzz doesn't have (it dedupes
+    to one URL per apex host) but this deliberately does NOT: against a
+    target with hundreds of alive hosts and a several-thousand-word list,
+    the per-host math alone can still add up to a multi-day pass with no
+    other way to stop it short.
 
     Writes triage/dirbrute_findings.txt. Returns the list of found URLs
     (empty if the wordlist is missing or nothing found)."""
@@ -1562,11 +1573,23 @@ def dir_brute(alive_path: Path, triage_dir: Path, rate: int, proxy: str | None,
     if not targets:
         return []
 
+    # Auto-derived unless overridden: wordlist size / rate is the expected
+    # time for one clean pass over one host with no recursion triggered;
+    # doubled as headroom for depth-2 recursion into any dirs it actually
+    # finds, floored so a fast/high-rate run still gets a sane minimum.
+    per_host_timeout = per_host_timeout if per_host_timeout is not None else max(120, (count_lines(wordlist) // max(rate, 1)) * 2)
+
     all_hits: list[str] = []
     failed_hosts = 0
+    timed_out_hosts = 0
     last_error = ""
+    job_start = time.time()
+    stopped_early_at = None
     progress = Progress("feroxbuster:dirbrute")
     for i, base_url in enumerate(targets, 1):
+        if time.time() - job_start > job_timeout:
+            stopped_early_at = i
+            break
         progress.update(f"{i}/{len(targets)} host(s)", percent=100 * (i - 1) / len(targets))
         out = triage_dir / f".ferox_{i}.jsonl"
         cmd = [
@@ -1577,7 +1600,11 @@ def dir_brute(alive_path: Path, triage_dir: Path, rate: int, proxy: str | None,
         if proxy:
             cmd += ["-p", proxy]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+            result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                     timeout=per_host_timeout)
+        except subprocess.TimeoutExpired:
+            timed_out_hosts += 1
+            continue
         except Exception as e:
             warn(f"feroxbuster failed against {base_url}: {e}")
             continue
@@ -1604,12 +1631,21 @@ def dir_brute(alive_path: Path, triage_dir: Path, rate: int, proxy: str | None,
                 if rec.get("type") == "response" and rec.get("url"):
                     all_hits.append(f"{rec['url']} [{rec.get('status')}]")
             out.unlink(missing_ok=True)
-    if failed_hosts == len(targets):
-        progress.stop(f"{YELLOW}[{ts()}] !{RESET} feroxbuster:dirbrute never actually scanned any of {len(targets)} "
+    attempted = (stopped_early_at - 1) if stopped_early_at is not None else len(targets)
+    if failed_hosts and failed_hosts == attempted:
+        progress.stop(f"{YELLOW}[{ts()}] !{RESET} feroxbuster:dirbrute never actually scanned any of {attempted} "
                        f"host(s) — every call errored out before producing output ({last_error}); treat as not run, not as a clean 0-result scan")
-    elif failed_hosts:
+    elif stopped_early_at is not None or failed_hosts or timed_out_hosts:
+        notes = []
+        if stopped_early_at is not None:
+            notes.append(f"hit the {job_timeout}s job deadline after {attempted}/{len(targets)} host(s) — "
+                         f"{len(targets) - attempted} host(s) not attempted, raise --dir-brute-timeout for full coverage")
+        if timed_out_hosts:
+            notes.append(f"{timed_out_hosts} host(s) exceeded the {per_host_timeout}s per-host timeout")
+        if failed_hosts:
+            notes.append(f"{failed_hosts} host(s) errored before producing output ({last_error})")
         progress.stop(f"{YELLOW}[{ts()}] !{RESET} feroxbuster:dirbrute complete — {len(all_hits)} path(s) found across "
-                       f"{len(targets) - failed_hosts}/{len(targets)} host(s) ({failed_hosts} errored before producing output: {last_error})")
+                       f"{attempted - failed_hosts - timed_out_hosts}/{len(targets)} fully-scanned host(s); " + "; ".join(notes))
     else:
         progress.stop(f"{GREEN}[{ts()}] ✓{RESET} feroxbuster:dirbrute complete — {len(all_hits)} path(s) found across {len(targets)} host(s)")
 
@@ -2912,6 +2948,9 @@ def main():
     parser.add_argument("--no-cloud-recon", action="store_true", help="Skip guessed S3/GCS/Azure bucket probing")
     parser.add_argument("--vhost-fuzz", action="store_true", help="Opt-in Host-header fuzzing via ffuf (high request volume)")
     parser.add_argument("--dir-brute", action="store_true", help="Opt-in directory brute-force via feroxbuster (high request volume)")
+    parser.add_argument("--dir-brute-timeout", type=int, default=3600,
+                         help="Wall-clock cap on the whole --dir-brute pass, seconds (default: 3600/1hr) — "
+                              "stops once the deadline's hit instead of working through every remaining host")
     parser.add_argument("--param-fuzz", action="store_true", help="Opt-in hidden-parameter discovery via arjun + x8")
     parser.add_argument("--param-fuzz-timeout", type=int, default=None,
                          help="Wall-clock cap per host for arjun+x8, seconds (default: auto — generous at low "
@@ -3123,7 +3162,8 @@ def main():
     dirbrute_hits = []
     if args.dir_brute:
         phase("DIRECTORY BRUTEFORCE")
-        dirbrute_hits = dir_brute(alive_path, triage_dir, args.rate, proxy_url, args.headers)
+        dirbrute_hits = dir_brute(alive_path, triage_dir, args.rate, proxy_url, args.headers,
+                                  job_timeout=args.dir_brute_timeout)
         if dirbrute_hits:
             warn(f"{len(dirbrute_hits)} path(s) found — see triage/dirbrute_findings.txt")
         else:
