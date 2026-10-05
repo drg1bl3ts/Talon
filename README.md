@@ -112,6 +112,7 @@ Dalfox is a Rust rewrite as of v3 — the installer always fetches the current p
 | --- | --- |
 | `-t, --target` | Single target domain, or a full URL (narrows scope to that exact host) |
 | `-l, --list` | Domain list file, or a HackerOne/Bugcrowd scope CSV export |
+| `--force-target` | Bypass the placeholder-domain guard (`target.com`/`example.com`/ALL-CAPS labels) — use only if your real target actually matches that shape |
 | `--skip-recon` | Reuse an existing results dir |
 | `--indir` | Custom output dir (default `results/<target>`, or `$OUTDIR`) |
 | `--param-jobs` | Parallel paramspider workers during recon (default 5) |
@@ -137,7 +138,9 @@ Dalfox is a Rust rewrite as of v3 — the installer always fetches the current p
 | `--dir-brute` | Opt-in directory brute-force (feroxbuster) |
 | `--bypass-403` | Retry `--dir-brute`'s 401/403 hits with a bypass matrix |
 | `--param-fuzz` | Opt-in hidden-parameter discovery (arjun + x8) |
+| `--param-fuzz-timeout` | Wall-clock cap per host for arjun+x8, seconds (default: auto — generous at low `--rate`, 300 at normal/high `--rate`) |
 | `--xss-confirm` | Opt-in: dalfox actually confirms reflected/DOM XSS against `xss_candidates.txt` (no-op if `xss` is filtered out) |
+| `--xss-confirm-timeout` | Wall-clock cap on the whole dalfox run, seconds (default 1800) — dalfox's own `--scan-timeout` only bounds one target, not the whole job |
 | `--no-nuclei-fuzz` | Skip nuclei's per-class fuzz pass — GF triage still runs, so `--param-fuzz`/`--xss-confirm`/the manual queue are unaffected. Use this to cut nuclei load and let the dedicated tooling do the work instead |
 | `--github-recon [ORG]` | gitleaks + sisakulint against an org's public repos (guesses org from domain if omitted) |
 | `--github-max-repos` | Cap repos cloned by `--github-recon` (default 20) |
