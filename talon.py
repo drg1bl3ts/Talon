@@ -1563,21 +1563,34 @@ def dir_brute(alive_path: Path, triage_dir: Path, rate: int, proxy: str | None,
         return []
 
     all_hits: list[str] = []
+    failed_hosts = 0
+    last_error = ""
     progress = Progress("feroxbuster:dirbrute")
     for i, base_url in enumerate(targets, 1):
         progress.update(f"{i}/{len(targets)} host(s)", percent=100 * (i - 1) / len(targets))
         out = triage_dir / f".ferox_{i}.jsonl"
         cmd = [
             "feroxbuster", "-u", base_url, "-w", str(wordlist), "--rate-limit", str(rate),
-            "-d", str(depth), "--json", "-o", str(out), "-q", "--silent", "-k",
+            "-d", str(depth), "--json", "-o", str(out), "--silent", "-k",
             "-T", str(timeout),
         ] + header_args(headers)
         if proxy:
             cmd += ["-p", proxy]
         try:
-            subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+            result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
         except Exception as e:
             warn(f"feroxbuster failed against {base_url}: {e}")
+            continue
+        # A non-zero exit with no output file at all means feroxbuster never
+        # started scanning this host — a CLI-arg/config error (e.g. two
+        # mutually exclusive flags), not "scanned and found nothing". That
+        # distinction matters: the former looks IDENTICAL to a clean empty
+        # scan unless checked, which is exactly how a broken flag combo
+        # here went unnoticed — every host "completing" in well under a
+        # second with 0 hits.
+        if result.returncode != 0 and not out.exists():
+            failed_hosts += 1
+            last_error = (result.stderr or "").strip().splitlines()[-1][:200] if (result.stderr or "").strip() else f"exit {result.returncode}"
             continue
         if out.exists():
             for line in out.read_text(errors="ignore").splitlines():
@@ -1591,7 +1604,14 @@ def dir_brute(alive_path: Path, triage_dir: Path, rate: int, proxy: str | None,
                 if rec.get("type") == "response" and rec.get("url"):
                     all_hits.append(f"{rec['url']} [{rec.get('status')}]")
             out.unlink(missing_ok=True)
-    progress.stop(f"{GREEN}[{ts()}] ✓{RESET} feroxbuster:dirbrute complete — {len(all_hits)} path(s) found across {len(targets)} host(s)")
+    if failed_hosts == len(targets):
+        progress.stop(f"{YELLOW}[{ts()}] !{RESET} feroxbuster:dirbrute never actually scanned any of {len(targets)} "
+                       f"host(s) — every call errored out before producing output ({last_error}); treat as not run, not as a clean 0-result scan")
+    elif failed_hosts:
+        progress.stop(f"{YELLOW}[{ts()}] !{RESET} feroxbuster:dirbrute complete — {len(all_hits)} path(s) found across "
+                       f"{len(targets) - failed_hosts}/{len(targets)} host(s) ({failed_hosts} errored before producing output: {last_error})")
+    else:
+        progress.stop(f"{GREEN}[{ts()}] ✓{RESET} feroxbuster:dirbrute complete — {len(all_hits)} path(s) found across {len(targets)} host(s)")
 
     result_file = triage_dir / "dirbrute_findings.txt"
     result_file.write_text("\n".join(sorted(all_hits)) + ("\n" if all_hits else ""))
