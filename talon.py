@@ -2695,6 +2695,35 @@ def _session_hash(headers: list[str]) -> str:
     return hashlib.sha256(material).hexdigest()[:12]
 
 
+_RAW_REQUEST_LINE_RE = re.compile(r"^[A-Z]+ \S+ HTTP/\d")
+
+
+def _parse_raw_request_headers(text: str) -> list[str]:
+    """Pulls header lines out of a raw saved HTTP request — a Burp 'Save
+    item', a Caido export, or a sqlmap-style request.txt — so --auth-file
+    can take the same artifact those tools already produce instead of
+    requiring a hand-built JSON file.
+
+    Only the header block (between the request line and the blank line
+    before any body) is used. Host and Content-Length are dropped: Host
+    would fight with -t's own target scoping, and a stale Content-Length
+    from the saved request doesn't match whatever body (if any) Talon's
+    own tools send."""
+    lines = text.replace("\r\n", "\n").split("\n")
+    skip = {"host", "content-length"}
+    headers = []
+    for line in lines[1:]:
+        if line.strip() == "":
+            break
+        if ":" not in line:
+            continue
+        name, _, value = line.partition(":")
+        if name.strip().lower() in skip:
+            continue
+        headers.append(f"{name.strip()}: {value.strip()}")
+    return headers
+
+
 def resolve_auth_headers(args) -> list[str]:
     """Merges --auth-file / --cookie / --bearer into args.headers — the
     exact same list every active-request function already threads through
@@ -2704,8 +2733,9 @@ def resolve_auth_headers(args) -> list[str]:
     of this function becomes auth-aware for free.
 
     Merge order (each layer can add to or override the one before it):
-    1. --auth-file's own "headers" dict
-    2. --auth-file's "cookie"/"bearer" keys
+    1. --auth-file's own "headers" dict (or, for a raw saved request, every
+       header it carries)
+    2. --auth-file's "cookie"/"bearer" keys (JSON form only)
     3. --cookie / --bearer flags
     4. whatever -H/--header the user also passed directly
 
@@ -2716,16 +2746,20 @@ def resolve_auth_headers(args) -> list[str]:
         path = Path(args.auth_file)
         if not path.exists():
             die(f"--auth-file not found: {args.auth_file}")
-        try:
-            data = json.loads(path.read_text())
-        except json.JSONDecodeError as e:
-            die(f"--auth-file is not valid JSON: {e}")
-        for name, value in (data.get("headers") or {}).items():
-            merged.append(f"{name}: {value}")
-        if data.get("cookie"):
-            merged.append(f"Cookie: {data['cookie']}")
-        if data.get("bearer"):
-            merged.append(f"Authorization: Bearer {data['bearer']}")
+        raw = path.read_text()
+        if _RAW_REQUEST_LINE_RE.match(raw.lstrip()):
+            merged.extend(_parse_raw_request_headers(raw))
+        else:
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as e:
+                die(f"--auth-file is not valid JSON (and doesn't look like a saved HTTP request either): {e}")
+            for name, value in (data.get("headers") or {}).items():
+                merged.append(f"{name}: {value}")
+            if data.get("cookie"):
+                merged.append(f"Cookie: {data['cookie']}")
+            if data.get("bearer"):
+                merged.append(f"Authorization: Bearer {data['bearer']}")
     if args.cookie:
         merged.append(f"Cookie: {args.cookie}")
     if args.bearer:
@@ -2756,6 +2790,7 @@ def main():
             "  talon.py -t example.com --ssrf --lfi   # only triage these vuln classes\n"
             "  talon.py -t example.com --bearer eyJhbGciOi...   # authenticated recon/triage\n"
             "  talon.py -t example.com --auth-file session.json   # cookie+bearer+extra headers from a file\n"
+            "  talon.py -t example.com --auth-file request.txt   # or a raw saved HTTP request (Burp/Caido/sqlmap-style)\n"
             "  talon.py -t example.com --dir-brute --bypass-403   # retry any 401/403 hits with a bypass matrix\n"
             "  talon.py -t example.com --param-fuzz   # arjun+x8 hidden-parameter discovery\n"
             "  talon.py -t example.com --xss-confirm   # dalfox: actually confirm reflected/DOM XSS\n"
@@ -2782,8 +2817,8 @@ def main():
     )
     parser.add_argument("--bearer", default=None, metavar="TOKEN", help="Bearer token (shorthand for -H 'Authorization: Bearer ...')")
     parser.add_argument(
-        "--auth-file", default=None, metavar="FILE.json",
-        help="JSON {cookie, bearer, headers}, merged before --cookie/--bearer/-H",
+        "--auth-file", default=None, metavar="FILE",
+        help="JSON {cookie, bearer, headers} OR a raw saved HTTP request (Burp/Caido export, sqlmap-style request.txt) — headers merged before --cookie/--bearer/-H",
     )
     parser.add_argument(
         "--proxy", choices=sorted(PROXY_TOOLS), default=None,
