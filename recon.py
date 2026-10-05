@@ -69,7 +69,43 @@ def is_valid_domain(d: str) -> bool:
     return bool(_DOMAIN_RE.match(d))
 
 
-def load_targets(target: str | None, list_file: str | None) -> tuple[list[str], str, bool]:
+# Known example/placeholder domains lifted straight from docs, --help
+# text, and copy-pasted tutorial commands — never a real engagement.
+_PLACEHOLDER_DOMAINS = {
+    "target.com", "example.com", "example.org", "example.net", "example.io",
+    "test.com", "domain.com", "yourtarget.com", "yourdomain.com", "foo.com",
+    "placeholder.com", "acme.com", "company.com", "site.com", "mytarget.com",
+}
+
+
+def _placeholder_reason(raw_target: str, hostname: str) -> str | None:
+    """Returns why `hostname` looks like a forgotten template slot rather
+    than a real target, or None if it looks fine. Two independent signals:
+
+    1. A known example/placeholder domain (the exact bug this guards
+       against: `talon.py -t TARGET.com ...` copy-pasted from a saved
+       command template and never edited — that ran a full night of live
+       recon/triage against the real target.com, an unrelated company).
+    2. A dot-separated label typed in ALL CAPS (TARGET.com, EXAMPLE.COM).
+       Real targets are essentially never typed shouting-case by hand —
+       that's the exact shape of an unedited <TARGET>/<DOMAIN> slot left
+       in place, independent of which placeholder word was used."""
+    if hostname in _PLACEHOLDER_DOMAINS or any(hostname.endswith("." + d) for d in _PLACEHOLDER_DOMAINS):
+        return f"'{hostname}' is a known example/placeholder domain, not a real target"
+    host_part = raw_target.split("://")[-1].split("/")[0]
+    for label in host_part.split("."):
+        core = label.split(":")[0]  # strip a trailing :port on the last label
+        if len(core) >= 3 and core.isalpha() and core.isupper():
+            return (
+                f"'{label}' is in ALL CAPS — looks like an unedited placeholder "
+                f"(e.g. left over from a copy-pasted example command), not a typed-out real target"
+            )
+    return None
+
+
+def load_targets(
+    target: str | None, list_file: str | None, allow_placeholder: bool = False,
+) -> tuple[list[str], str, bool]:
     """Handles -t/-l target selection: a single validated domain, a single
     full URL, or a deduped, validated set of domains from a file —
     one-per-line, or a raw HackerOne scope CSV export (detected by .csv
@@ -82,6 +118,10 @@ def load_targets(target: str | None, list_file: str | None) -> tuple[list[str], 
     to skip subdomain discovery entirely and tells talon.py's scope filter
     to accept that exact host only — no subdomains. A bare domain keeps the
     existing behavior (full subfinder-and-friends subdomain sweep).
+
+    `allow_placeholder` bypasses _placeholder_reason()'s guard (talon.py's
+    --force-target) for the rare case of a real target that happens to
+    match the heuristic.
 
     Returns (targets, label, single_host_only)."""
     if target and list_file:
@@ -96,9 +136,17 @@ def load_targets(target: str | None, list_file: str | None) -> tuple[list[str], 
             hostname = (parsed.hostname or "").lower()
             if not hostname or not is_valid_domain(hostname):
                 raise ValueError(f"Invalid target URL: {target}")
+            if not allow_placeholder:
+                reason = _placeholder_reason(target, hostname)
+                if reason:
+                    raise ValueError(f"{reason}. If this is really your target, pass --force-target.")
             if parsed.path not in ("", "/") or parsed.query:
                 warn(f"Target URL's path/query is ignored — scope narrowed to host {hostname} only")
             return [hostname], target, True
+        if not allow_placeholder:
+            reason = _placeholder_reason(target, target.lower())
+            if reason:
+                raise ValueError(f"{reason}. If this is really your target, pass --force-target.")
         target = target.lower()
         if not is_valid_domain(target):
             raise ValueError(f"Invalid target: {target}")
@@ -498,7 +546,8 @@ def param_discovery(endpoints_path: Path, alive_path: Path, outdir: Path, jobs: 
 # ──────────────────────────────────────────────────────────────
 
 def run_full_recon(target: str | None, list_file: str | None, outdir: Path,
-                    param_jobs: int = 5, headers: list[str] | None = None, rate: int = 50) -> Path:
+                    param_jobs: int = 5, headers: list[str] | None = None, rate: int = 50,
+                    allow_placeholder: bool = False) -> Path:
     """Runs the complete recon pipeline directly against the underlying
     tools, writing results into `outdir` in the layout Talon's triage
     stage expects. Returns outdir.
@@ -509,10 +558,11 @@ def run_full_recon(target: str | None, list_file: str | None, outdir: Path,
     or paramspider, which has no -H equivalent. `rate` (requests/sec) is
     passed to the same httpx/katana calls — every phase that touches the
     live target respects one consistent ceiling, not just triage's nuclei
-    passes."""
+    passes. `allow_placeholder` bypasses load_targets()'s placeholder-domain
+    guard (talon.py's --force-target)."""
     which_or_die(RECON_TOOLS)
 
-    targets, label, single_host_only = load_targets(target, list_file)
+    targets, label, single_host_only = load_targets(target, list_file, allow_placeholder=allow_placeholder)
 
     outdir.mkdir(parents=True, exist_ok=True)
     outdir = outdir.resolve()

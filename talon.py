@@ -841,10 +841,12 @@ def banner():
 
 
 def run_recon_pipeline(target: str | None, list_file: str | None, outdir: Path, param_jobs: int,
-                        headers: list[str] | None = None, rate: int = 50) -> Path:
+                        headers: list[str] | None = None, rate: int = 50,
+                        allow_placeholder: bool = False) -> Path:
     phase("RECON — subdomains → alive → DNS → ports → crawl → params")
     try:
-        result_dir = recon.run_full_recon(target, list_file, outdir, param_jobs=param_jobs, headers=headers, rate=rate)
+        result_dir = recon.run_full_recon(target, list_file, outdir, param_jobs=param_jobs, headers=headers, rate=rate,
+                                           allow_placeholder=allow_placeholder)
     except ValueError as e:
         die(str(e))
     success("Recon complete")
@@ -1597,7 +1599,7 @@ def dir_brute(alive_path: Path, triage_dir: Path, rate: int, proxy: str | None,
 
 
 def param_fuzz(alive_path: Path, triage_dir: Path, rate: int, proxy: str | None,
-               headers: list[str] | None, timeout: int = 15) -> Path:
+               headers: list[str] | None, timeout: int = 15, job_timeout: int | None = None) -> Path:
     """--param-fuzz only (opt-in, same volume/rate-limit tier as
     --vhost-fuzz/--dir-brute). Runs arjun and x8 against one representative
     URL per alive host (same "representative host" discipline as
@@ -1605,9 +1607,23 @@ def param_fuzz(alive_path: Path, triage_dir: Path, rate: int, proxy: str | None,
     up in any crawled/historical URL — closes a real gap GF/nuclei can't:
     those only ever triage parameters that are ALREADY in a URL somewhere.
 
+    arjun's thread count (`-t`) is NOT derived from `rate` — confirmed
+    against arjun's own --help, `--rate-limit` already caps the global
+    outbound rate on its own regardless of thread count, so tying `-t` to
+    a low `--rate` only starved it of its own default concurrency (5) for
+    no safety benefit. The per-host subprocess deadline below (`job_
+    timeout`/--param-fuzz-timeout) is what actually needs to track `rate`:
+    arjun's default ~26k-word list means a low --rate can need far longer
+    than a fixed budget to even get through one host — this was the exact
+    shape of the arjun timeout seen running --param-fuzz at --rate 5.
+
     Writes triage/hidden_params_found.txt (one "host: param" per line,
     deduped). Both tools are soft-best-effort per host — one timing out or
     erroring doesn't abort the pass for the rest."""
+    # Auto-derived unless overridden: generous at low rate (where the
+    # wordlist-vs-throughput math is the actual risk), floored at the old
+    # fixed 300s for normal/high rate so typical runs don't change at all.
+    per_host_timeout = job_timeout if job_timeout is not None else max(300, 3000 // max(rate, 1))
     if not alive_path.exists():
         return triage_dir / "hidden_params_found.txt"
     hosts_by_apex: dict[str, str] = {}
@@ -1650,13 +1666,13 @@ def param_fuzz(alive_path: Path, triage_dir: Path, rate: int, proxy: str | None,
         host = urlparse(base_url).hostname or base_url
 
         arjun_out = triage_dir / f".arjun_{i}.json"
-        arjun_cmd = ["arjun", "-u", base_url, "-oJ", str(arjun_out), "-t", str(max(1, rate // 5)),
+        arjun_cmd = ["arjun", "-u", base_url, "-oJ", str(arjun_out), "-t", "5",
                      "--rate-limit", str(rate), "-T", str(timeout)]
         if header_list:
             arjun_cmd += ["--headers", "\n".join(header_list)]
         try:
             subprocess.run(arjun_cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                            timeout=timeout * 20, env=arjun_env)
+                            timeout=per_host_timeout, env=arjun_env)
         except Exception as e:
             warn(f"arjun failed against {base_url}: {e}")
         if arjun_out.exists():
@@ -1675,7 +1691,7 @@ def param_fuzz(alive_path: Path, triage_dir: Path, rate: int, proxy: str | None,
         if proxy:
             x8_cmd += ["--proxy", proxy]
         try:
-            subprocess.run(x8_cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout * 20)
+            subprocess.run(x8_cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=per_host_timeout)
         except Exception as e:
             warn(f"x8 failed against {base_url}: {e}")
         if x8_out.exists():
@@ -1796,8 +1812,8 @@ def bypass_403(triage_dir: Path, rate: int, proxy: str | None, headers: list[str
     return results
 
 
-def xss_confirm(triage_dir: Path, rate: int, proxy: str | None, headers: list[str] | None,
-                 timeout: int = 10) -> list[dict]:
+def xss_confirm(triage_dir: Path, nuclei_dir: Path, rate: int, proxy: str | None, headers: list[str] | None,
+                 timeout: int = 10, max_candidates: int | None = None, job_timeout: int = 1800) -> list[dict]:
     """--xss-confirm only (opt-in). Runs dalfox (v3, Rust — github.com/hahwul/dalfox;
     NOT the older v2 Go line, which the project's own docs call a
     security-backports-only branch now) in file-input mode against
@@ -1820,6 +1836,20 @@ def xss_confirm(triage_dir: Path, rate: int, proxy: str | None, headers: list[st
     isn't wired here either; run dalfox by hand with a callback domain for
     that, this function only automates the directly-confirmable case.
 
+    Candidates are deduped/capped by `max_candidates` the same way
+    nuclei_class_scans() caps nuclei's own fuzz classes (dedupe_fuzz_
+    candidates()) — dalfox has no equivalent of its own, and file-input
+    mode was otherwise handed every raw GF match uncapped.
+
+    dalfox's own --scan-timeout only bounds the per-target injection
+    stage, not the whole file-input run — against thousands of candidates
+    behind a throttling edge/WAF, the overall job has no ceiling at all
+    and can run for days without dalfox itself ever erroring out. `job_
+    timeout` (default 1800s/30min, --xss-confirm-timeout) is Talon's own
+    wall-clock cap on the whole subprocess; on expiry the process is
+    killed and whatever partial/absent JSON results is treated the same
+    as any other unparseable report — a loud warning, not a crash.
+
     Writes triage/dalfox_findings.json. Returns [] (not an error) if
     xss_candidates.txt doesn't exist or is empty — most commonly because
     the vulnerability-class filter excluded xss this run."""
@@ -1829,8 +1859,13 @@ def xss_confirm(triage_dir: Path, rate: int, proxy: str | None, headers: list[st
         out_path.write_text(json.dumps({"findings": []}))
         return []
 
+    scan_path, total, deduped = dedupe_fuzz_candidates(candidates_path, nuclei_dir, "xss", max_candidates)
+    if deduped < total:
+        info(f"xss: {total} candidate(s) collapsed to {deduped} unique injection point(s) for dalfox"
+             + (f"; capped from a larger unique set by --max-candidates" if max_candidates and deduped == max_candidates else ""))
+
     cmd = [
-        "dalfox", "scan", "--input-type", "file", str(candidates_path),
+        "dalfox", "scan", "--input-type", "file", str(scan_path),
         "-f", "json", "-o", str(out_path), "-S",
         "--rate-limit", str(rate), "--timeout", str(timeout), "--scan-timeout", "300",
     ]
@@ -1844,8 +1879,12 @@ def xss_confirm(triage_dir: Path, rate: int, proxy: str | None, headers: list[st
     # successful scan as a warning. Success/failure here is judged by
     # whether the JSON report parses, not the exit code.
     progress = Progress("dalfox:xss-confirm")
+    timed_out = False
     try:
-        subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=job_timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
     except Exception as e:
         progress.stop(f"{YELLOW}[{ts()}] !{RESET} dalfox:xss-confirm failed to run: {e}")
         return []
@@ -1856,7 +1895,13 @@ def xss_confirm(triage_dir: Path, rate: int, proxy: str | None, headers: list[st
             findings = json.loads(out_path.read_text()).get("findings", [])
         except json.JSONDecodeError:
             pass
-    progress.stop(f"{GREEN}[{ts()}] ✓{RESET} dalfox:xss-confirm complete — {len(findings)} finding(s)")
+
+    if timed_out:
+        progress.stop(f"{YELLOW}[{ts()}] !{RESET} dalfox:xss-confirm hit the {job_timeout}s job deadline against "
+                       f"{deduped} target(s) — killed, {len(findings)} finding(s) from before the cutoff "
+                       f"(raise --xss-confirm-timeout or lower --max-candidates if this target needs more time)")
+    else:
+        progress.stop(f"{GREEN}[{ts()}] ✓{RESET} dalfox:xss-confirm complete — {len(findings)} finding(s)")
     return findings
 
 
@@ -2665,7 +2710,9 @@ def discord_notify(target: str, url_count: int, secret_count: int, verified_secr
             detail(result.stderr.strip().splitlines()[-1][:150])
 
 
-def determine_target_and_label(target: str | None, list_file: str | None) -> tuple[str, str]:
+def determine_target_and_label(
+    target: str | None, list_file: str | None, allow_placeholder: bool = False,
+) -> tuple[str, str]:
     """Returns (outdir_target, display_label), used by resolve_outdir() as
     the results/<outdir_target> name when --indir/$OUTDIR aren't set.
 
@@ -2675,9 +2722,12 @@ def determine_target_and_label(target: str | None, list_file: str | None) -> tup
     typically one directory per engagement (e.g. ~/work/coupang/domains.txt),
     and that folder name reads far better as the results dir than an
     arbitrary domain would. Falls back to the first domain if the list file
-    has no meaningful parent (e.g. it's at filesystem root)."""
+    has no meaningful parent (e.g. it's at filesystem root).
+
+    `allow_placeholder` is --force-target — bypasses load_targets()'s
+    unedited-placeholder guard (TARGET.com, EXAMPLE.com, ALL-CAPS labels)."""
     try:
-        targets, label, _ = recon.load_targets(target, list_file)
+        targets, label, _ = recon.load_targets(target, list_file, allow_placeholder=allow_placeholder)
     except ValueError as e:
         die(str(e))
     if list_file:
@@ -2802,6 +2852,11 @@ def main():
     target_group = parser.add_mutually_exclusive_group(required=True)
     target_group.add_argument("-t", "--target", default=None, help="Target domain, or a full URL to scope to that exact host")
     target_group.add_argument("-l", "--list", dest="list_file", default=None, help="Domain list file, or a HackerOne/Bugcrowd scope CSV")
+    parser.add_argument(
+        "--force-target", action="store_true",
+        help="Bypass the placeholder-domain guard (target.com/example.com/ALL-CAPS labels) — "
+             "use only if your real target actually matches that shape",
+    )
     parser.add_argument("--skip-recon", action="store_true", help="Reuse an existing results dir instead of re-running recon")
     parser.add_argument("--indir", default=None, help="Custom output dir (default: results/<target> or $OUTDIR)")
     parser.add_argument("--param-jobs", type=int, default=5, help="Parallel paramspider workers (default: 5)")
@@ -2838,7 +2893,13 @@ def main():
     parser.add_argument("--vhost-fuzz", action="store_true", help="Opt-in Host-header fuzzing via ffuf (high request volume)")
     parser.add_argument("--dir-brute", action="store_true", help="Opt-in directory brute-force via feroxbuster (high request volume)")
     parser.add_argument("--param-fuzz", action="store_true", help="Opt-in hidden-parameter discovery via arjun + x8")
+    parser.add_argument("--param-fuzz-timeout", type=int, default=None,
+                         help="Wall-clock cap per host for arjun+x8, seconds (default: auto — generous at low "
+                              "--rate, 300 at normal/high --rate)")
     parser.add_argument("--xss-confirm", action="store_true", help="Opt-in: confirm reflected/DOM XSS with dalfox against xss_candidates.txt")
+    parser.add_argument("--xss-confirm-timeout", type=int, default=1800,
+                         help="Wall-clock cap on the whole dalfox --xss-confirm run, seconds (default: 1800/30min) — "
+                              "dalfox's own --scan-timeout only bounds one target, not the whole job")
     parser.add_argument("--bypass-403", action="store_true", help="Retry --dir-brute's 401/403 hits with a bypass matrix (needs --dir-brute)")
     parser.add_argument("--no-nuclei-fuzz", action="store_true", help="Skip nuclei's per-class fuzz pass — GF triage still runs, so --param-fuzz/--xss-confirm/the manual queue are unaffected")
     parser.add_argument("--github-recon", nargs="?", const="", default=None, metavar="ORG",
@@ -2892,7 +2953,7 @@ def main():
         active_hostlevel_slugs = [c["slug"] for c in HOSTLEVEL_CLASSES]
         skipped_classes = []
 
-    outdir_target, target_label = determine_target_and_label(args.target, args.list_file)
+    outdir_target, target_label = determine_target_and_label(args.target, args.list_file, allow_placeholder=args.force_target)
 
     required_tools = ["gf", "nuclei", "httpx", "anew"]
     if args.proxy or not args.no_cms_probe:
@@ -2916,7 +2977,8 @@ def main():
     outdir = resolve_outdir(outdir_target, args.indir)
 
     if not args.skip_recon:
-        run_recon_pipeline(args.target, args.list_file, outdir, args.param_jobs, args.headers, args.rate)
+        run_recon_pipeline(args.target, args.list_file, outdir, args.param_jobs, args.headers, args.rate,
+                           allow_placeholder=args.force_target)
     else:
         info(f"--skip-recon set — reusing existing results for {target_label}")
 
@@ -3059,7 +3121,8 @@ def main():
     hidden_params = []
     if args.param_fuzz:
         phase("ACTIVE PARAMETER FUZZING")
-        hidden_params_path = param_fuzz(alive_path, triage_dir, args.rate, proxy_url, args.headers)
+        hidden_params_path = param_fuzz(alive_path, triage_dir, args.rate, proxy_url, args.headers,
+                                         job_timeout=args.param_fuzz_timeout)
         hidden_params = [l.strip() for l in hidden_params_path.read_text(errors="ignore").splitlines() if l.strip()]
         if hidden_params:
             warn(f"{len(hidden_params)} hidden parameter(s) found — see triage/hidden_params_found.txt")
@@ -3193,7 +3256,8 @@ def main():
     if args.xss_confirm:
         if any(c["slug"] == "xss" for c in active_fuzz_classes):
             phase("XSS CONFIRMATION — dalfox")
-            xss_confirmed_findings = xss_confirm(triage_dir, args.rate, proxy_url, args.headers)
+            xss_confirmed_findings = xss_confirm(triage_dir, nuclei_dir, args.rate, proxy_url, args.headers,
+                                                  max_candidates=args.max_candidates, job_timeout=args.xss_confirm_timeout)
             verified = sum(1 for f in xss_confirmed_findings if f.get("type") == "V")
             if xss_confirmed_findings:
                 warn(f"{len(xss_confirmed_findings)} dalfox finding(s) — {verified} confirmed exploitable (type V) — see triage/dalfox_findings.json")
