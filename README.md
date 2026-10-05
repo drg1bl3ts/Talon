@@ -120,7 +120,7 @@ Dalfox is a Rust rewrite as of v3 — the installer always fetches the current p
 | `-H, --header` | Custom header on every request. Repeatable |
 | `--cookie` | Session cookie, shorthand for `-H 'Cookie: ...'` |
 | `--bearer` | Bearer token, shorthand for `-H 'Authorization: Bearer ...'` |
-| `--auth-file` | JSON `{"cookie","bearer","headers"}`, OR a raw saved HTTP request (Burp "Save item", Caido export, sqlmap-style `request.txt`) — headers merged before `--cookie`/`--bearer`/`-H`. Detected by request-line sniffing; `Host`/`Content-Length` are dropped |
+| `--auth-file` | JSON `{"cookie","bearer","headers"}`, OR a raw saved HTTP request (Burp "Save item", Caido export, sqlmap-style `request.txt`) |
 | `--proxy` | `caido` or `burp` — warm up the manual queue through that proxy |
 | `--proxy-timeout`, `--proxy-delay` | Proxy warm-up tuning |
 | `--xss`, `--sqli`, `--ssrf`, `--lfi`, `--ssti`, `--img-traversal`, `--redirect`, `--idor`, `--interestingparams`, `--debug-logic`, `--rce`, `--nosqli`, `--proto-pollution`, `--cors`, `--headers`, `--hardening`, `--graphql`, `--smuggling`, `--cookies`, `--takeover` | Restrict triage to these classes only (default: all) |
